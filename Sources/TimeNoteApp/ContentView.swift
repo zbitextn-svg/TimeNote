@@ -412,7 +412,7 @@ struct ContentView: View {
 
     private var tabStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 4) {
+            HStack(spacing: 10) {
                 ForEach(Array(store.tabs.enumerated()), id: \.element.id) { index, tab in
                     if renamingTabID == tab.id, tab.kind == .text {
                         TextField("标签名", text: $renamingTabTitle)
@@ -451,7 +451,8 @@ struct ContentView: View {
                             tab: tab,
                             isSelected: store.selectedTabID == tab.id && isSearching == false,
                             badge: tab.kind == .mainLog ? store.entries.count : nil,
-                            shortcutIndex: index < 9 ? index + 1 : nil
+                            shortcutIndex: index < 9 ? index + 1 : nil,
+                            onClose: tab.kind == .text ? { requestDeleteTab(tab) } : nil
                         )
                         .onTapGesture {
                             // 点了另一个标签：先提交正在进行的重命名（不必先按回车），再切换。
@@ -484,7 +485,7 @@ struct ContentView: View {
                                 .disabled(index >= store.tabs.count - 1)
                                 Divider()
                                 Button("删除标签…", role: .destructive) {
-                                    pendingConfirmation = .deleteTab(id: tab.id, name: tab.title)
+                                    requestDeleteTab(tab)
                                 }
                             } else {
                                 Button("复制全部场记") {
@@ -506,8 +507,11 @@ struct ContentView: View {
                 .padding(.leading, 2)
             }
             .padding(.horizontal, Theme.Spacing.pageHorizontal - 4)
+            // 顶部留出位置给标签右上角的删除按钮，避免被滚动区域裁掉
+            .padding(.top, 8)
             .padding(.bottom, 8)
         }
+        .padding(.top, -8)
     }
 
     // MARK: 内容
@@ -621,6 +625,19 @@ struct ContentView: View {
     private func flushAllPendingEdits() {
         flushPendingProjectRename()
         store.flushAllPendingEdits()
+    }
+
+    /// 点标签右上角的 × 或右键「删除标签」：空标签直接删除，有内容时先确认
+    private func requestDeleteTab(_ tab: TabItem) {
+        guard tab.kind == .text else { return }
+        if renamingTabID == tab.id {
+            cancelRenaming()
+        }
+        if store.textTabHasContent(tab.id) {
+            pendingConfirmation = .deleteTab(id: tab.id, name: tab.title)
+        } else {
+            store.deleteTab(tabID: tab.id)
+        }
     }
 
     private func createTextTabAndRename() {
@@ -833,7 +850,10 @@ private struct TabPill: View {
     let isSelected: Bool
     let badge: Int?
     let shortcutIndex: Int?
+    /// 文本标签右上角的删除按钮；主场记传 nil，不显示
+    var onClose: (() -> Void)? = nil
     @State private var isHovered = false
+    @State private var isCloseHovered = false
 
     var body: some View {
         HStack(spacing: 6) {
@@ -870,6 +890,30 @@ private struct TabPill: View {
             }
         }
         .contentShape(Rectangle())
+        .overlay(alignment: .topTrailing) {
+            if let onClose, isSelected || isHovered || isCloseHovered {
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 7.5, weight: .heavy))
+                        .foregroundStyle(isCloseHovered ? Color.white : Theme.textSecondary)
+                        .frame(width: 16, height: 16)
+                        .background(
+                            Circle().fill(isCloseHovered ? Theme.danger : Theme.surfaceMuted)
+                        )
+                        .overlay(
+                            Circle().strokeBorder(isCloseHovered ? Color.clear : Theme.hairline, lineWidth: 1)
+                        )
+                        .contentShape(Circle().inset(by: -4))
+                }
+                .buttonStyle(.plain)
+                .onHover { isCloseHovered = $0 }
+                .help("删除标签")
+                .accessibilityLabel("删除标签“\(tab.title)”")
+                .offset(x: 7, y: -7)
+                .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.12), value: isHovered || isSelected || isCloseHovered)
         .onHover { isHovered = $0 }
         .help(helpText)
     }
@@ -2085,7 +2129,7 @@ private enum PendingConfirmation: Identifiable {
         case .deleteAttachment(_, let name):
             return "“\(name)”的记录和已导入的文件都会被删除。"
         case .deleteTab(_, let name):
-            return "“\(name)”中的文本内容将被删除。"
+            return "“\(name)”中的文本内容将被永久删除，无法撤销。"
         }
     }
 

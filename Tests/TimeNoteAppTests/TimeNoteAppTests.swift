@@ -610,3 +610,42 @@ func packageScriptVersionMatchesAppVersion() throws {
     #expect(AppInfo.version == "1.1.23")
     #expect(script.contains("APP_VERSION=\"${APP_VERSION:-\(AppInfo.version)}\""))
 }
+
+// MARK: - 标签删除按钮
+
+@MainActor
+@Test
+func textTabContentCheckDecidesWhetherDeleteNeedsConfirmation() throws {
+    let store = try makeIsolatedStore()
+    store.createProject()
+    let emptyTab = try #require(store.addTextTab())
+    #expect(store.textTabHasContent(emptyTab) == false)
+
+    let filledTab = try #require(store.addTextTab())
+    // 尚未自动保存的草稿也算有内容
+    store.updateCurrentTextTabBody("镜头 3 要补拍")
+    #expect(store.textTabHasContent(filledTab))
+
+    // 只有空白字符算空
+    let blankTab = try #require(store.addTextTab())
+    store.updateCurrentTextTabBody("  \n ")
+    #expect(store.textTabHasContent(blankTab) == false)
+}
+
+@MainActor
+@Test
+func deletingSelectedTextTabFallsBackToMainLog() throws {
+    let store = try makeIsolatedStore()
+    store.createProject()
+    let mainTabID = try #require(store.tabs.first(where: { $0.kind == .mainLog })?.id)
+    let textTabID = try #require(store.addTextTab())
+    #expect(store.selectedTabID == textTabID)
+
+    store.deleteTab(tabID: textTabID)
+
+    #expect(store.tabs.contains(where: { $0.id == textTabID }) == false)
+    #expect(store.selectedTabID == mainTabID)
+    // 主场记不能被删除
+    store.deleteTab(tabID: mainTabID)
+    #expect(store.tabs.contains(where: { $0.id == mainTabID }))
+}

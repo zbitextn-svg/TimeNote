@@ -282,6 +282,19 @@ final class TimeNoteStore: ObservableObject {
         }
     }
 
+    /// 文本标签里是否有内容（包含尚未保存的草稿），用于决定删除前是否需要确认
+    func textTabHasContent(_ tabID: String) -> Bool {
+        let body: String
+        if let draft = textDraftBodies[tabID] {
+            body = draft
+        } else if selectedTabID == tabID, selectedTab?.kind == .text {
+            body = currentTextTabBody
+        } else {
+            body = tabs.first(where: { $0.id == tabID })?.body ?? ""
+        }
+        return body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
     func deleteTab(tabID: String) {
         performDatabaseUpdate {
             try database.deleteTab(tabID: tabID)
