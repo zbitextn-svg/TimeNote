@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+<!-- 小尺寸（16/32 px）简化版：更粗的线条、更少的斜纹，去掉浅色标签条 -->
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3A352F"/><stop offset="1" stop-color="#1B1916"/></linearGradient>
+<linearGradient id="paper" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FDFAF4"/><stop offset="1" stop-color="#EDE4D6"/></linearGradient>
+<clipPath id="clip"><path d="M100,284 C100,160 160,100 284,100 L740,100 C864,100 924,160 924,284 L924,740 C924,864 864,924 740,924 L284,924 C160,924 100,864 100,740 Z"/></clipPath>
+<clipPath id="stick"><rect x="0" y="0" width="600" height="110" rx="26"/></clipPath>
+<clipPath id="body"><rect x="212" y="372" width="600" height="470" rx="48"/></clipPath>
+</defs>
+<path d="M100,284 C100,160 160,100 284,100 L740,100 C864,100 924,160 924,284 L924,740 C924,864 864,924 740,924 L284,924 C160,924 100,864 100,740 Z" fill="url(#bg)"/>
+<g clip-path="url(#clip)">
+<g transform="translate(212,262) rotate(-11 0 110)">
+<g clip-path="url(#stick)">
+<rect x="0" y="0" width="600" height="110" fill="#F2A541"/>
+<g fill="#26221E">
+<polygon points="40,0 140,0 90,110 -10,110"/>
+<polygon points="240,0 340,0 290,110 190,110"/>
+<polygon points="440,0 540,0 490,110 390,110"/>
+</g>
+</g>
+</g>
+<rect x="212" y="372" width="600" height="470" rx="48" fill="url(#paper)"/>
+<g clip-path="url(#body)">
+<rect x="212" y="372" width="600" height="110" fill="#F2A541"/>
+<g fill="#26221E">
+<polygon points="252,372 352,372 302,482 202,482"/>
+<polygon points="452,372 552,372 502,482 402,482"/>
+<polygon points="652,372 752,372 702,482 602,482"/>
+</g>
+</g>
+<rect x="312" y="540" width="34" height="250" rx="17" fill="#D9771F"/>
+<circle cx="329" cy="566" r="40" fill="#D9771F"/>
+<circle cx="329" cy="666" r="40" fill="#D9771F"/>
+<circle cx="329" cy="766" r="44" fill="#D9771F"/>
+<rect x="398" y="546" width="330" height="40" rx="20" fill="#2F2A24"/>
+<rect x="398" y="646" width="260" height="40" rx="20" fill="#2F2A24"/>
+<rect x="398" y="746" width="340" height="40" rx="20" fill="#2F2A24"/>
+</g>
+</svg>

@@ -67,6 +67,10 @@ zsh scripts/package_app.sh
 
 只安装了命令行工具（没有 Xcode）时，较新的 SDK 中 SwiftUI 依赖宏插件，可能需要指定较旧的 SDK，例如 `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk zsh scripts/package_app.sh`。
 
+## 应用图标
+
+图标源文件在 `design/`：`AppIcon.svg` 为标准版，`AppIcon-small.svg` 为 16 / 32 px 的简化版（线条更粗、细节更少，保证小尺寸清晰）。`Sources/TimeNoteApp/Assets.xcassets/AppIcon.appiconset/` 中的 PNG 由它们导出，修改图标时请同时更新这两处。
+
 ## 项目结构
 
 | 路径 | 用途 |
@@ -77,7 +81,8 @@ zsh scripts/package_app.sh
 | `Sources/TimeNoteApp/Models.swift` | 数据模型和时间处理 |
 | `Sources/TimeNoteApp/*Service.swift` | 附件、备份恢复、导出及窗口管理 |
 | `Tests/TimeNoteAppTests/` | Swift Testing 测试 |
-| `scripts/` | 图标生成与应用打包 |
+| `scripts/` | 应用打包与开发监听脚本 |
+| `design/` | 应用图标源文件（SVG） |
 | `docs/` | 历史产品需求与开发方案，仅作背景参考 |
 
 ## 数据与备份

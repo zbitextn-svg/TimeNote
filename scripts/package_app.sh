@@ -19,10 +19,13 @@ APPICONSET_DIR="$ROOT_DIR/Sources/TimeNoteApp/Assets.xcassets/AppIcon.appiconset
 ICONSET_TMP_DIR="$DIST_DIR/AppIcon.iconset"
 ICON_PATH="$RESOURCES_DIR/AppIcon.icns"
 
-# 图标 PNG 已存在时跳过生成（避免沙箱拦截 swift 子进程的文件覆盖）
-if [[ ! -f "$APPICONSET_DIR/icon_512x512@2x.png" ]]; then
-  swift "$ROOT_DIR/scripts/generate_app_icon.swift" "$ROOT_DIR"
-fi
+# 图标 PNG 由 design/AppIcon.svg（16/32 px 用 design/AppIcon-small.svg）导出，提交在仓库中
+for icon in icon_16x16 icon_16x16@2x icon_32x32 icon_32x32@2x icon_128x128 icon_128x128@2x icon_256x256 icon_256x256@2x icon_512x512 icon_512x512@2x; do
+  if [[ ! -f "$APPICONSET_DIR/$icon.png" ]]; then
+    echo "缺少图标文件：$APPICONSET_DIR/$icon.png" >&2
+    exit 1
+  fi
+done
 swift build -c release
 
 rm -rf "$APP_DIR"
