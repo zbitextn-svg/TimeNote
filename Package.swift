@@ -1,5 +1,5 @@
-// swift-tools-version: 6.3
-// The swift-tools-version declares the minimum version of Swift required to build this package.
+// swift-tools-version: 6.1
+// 最低 Swift 6.1（Xcode 16.3 / Command Line Tools 16.3 及以上）
 
 import PackageDescription
 

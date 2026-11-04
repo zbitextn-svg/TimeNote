@@ -47,13 +47,9 @@ enum RecoveryService {
             return nil
         }
 
-        let integrityMessage: String
-        do {
-            integrityMessage = try runIntegrityCheck(at: databaseURL)
-        } catch {
-            integrityMessage = error.localizedDescription
-        }
-        guard integrityMessage != "ok" else {
+        // 只有确认数据库损坏时才隔离；数据库被占用、权限等临时问题不应触发"恢复"，
+        // 否则会把一个完好的数据库挪走，造成数据丢失的假象。
+        guard case .corrupted = checkIntegrity(at: databaseURL) else {
             return nil
         }
 
@@ -187,31 +183,56 @@ enum RecoveryService {
         }
     }
 
-    private static func runIntegrityCheck(at databaseURL: URL) throws -> String {
+    enum IntegrityStatus: Equatable {
+        case ok
+        case corrupted(String)
+        /// 无法完成检查（被占用、权限、IO 等），不代表数据库已损坏
+        case inconclusive(String)
+    }
+
+    static func checkIntegrity(at databaseURL: URL) -> IntegrityStatus {
         var database: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
-        guard sqlite3_open_v2(databaseURL.path, &database, flags, nil) == SQLITE_OK, let database else {
-            let message = database.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "未知错误"
-            sqlite3_close(database)
-            throw RecoveryIssue.openFailed("数据库打开失败：\(message)")
-        }
+        let openResult = sqlite3_open_v2(databaseURL.path, &database, flags, nil)
         defer { sqlite3_close(database) }
+        guard openResult == SQLITE_OK, let database else {
+            let message = database.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "未知错误"
+            return classify(code: openResult, message: "数据库打开失败：\(message)")
+        }
+        sqlite3_busy_timeout(database, 3000)
 
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(database, "PRAGMA quick_check(1);", -1, &statement, nil) == SQLITE_OK, let statement else {
-            throw RecoveryIssue.integrityCheckFailed("数据库完整性检查启动失败：\(String(cString: sqlite3_errmsg(database)))")
-        }
+        let prepareResult = sqlite3_prepare_v2(database, "PRAGMA quick_check(1);", -1, &statement, nil)
         defer { sqlite3_finalize(statement) }
+        guard prepareResult == SQLITE_OK, let statement else {
+            return classify(
+                code: sqlite3_errcode(database),
+                message: "数据库完整性检查启动失败：\(String(cString: sqlite3_errmsg(database)))"
+            )
+        }
 
-        let result = sqlite3_step(statement)
-        guard result == SQLITE_ROW else {
-            throw RecoveryIssue.integrityCheckFailed("数据库完整性检查执行失败：\(String(cString: sqlite3_errmsg(database)))")
+        let stepResult = sqlite3_step(statement)
+        guard stepResult == SQLITE_ROW else {
+            return classify(
+                code: sqlite3_errcode(database),
+                message: "数据库完整性检查执行失败：\(String(cString: sqlite3_errmsg(database)))"
+            )
         }
 
         guard let textPointer = sqlite3_column_text(statement, 0) else {
-            return "unknown"
+            return .inconclusive("完整性检查没有返回结果")
         }
-        return String(cString: textPointer)
+        let result = String(cString: textPointer)
+        return result == "ok" ? .ok : .corrupted(result)
+    }
+
+    private static func classify(code: Int32, message: String) -> IntegrityStatus {
+        switch code & 0xFF {
+        case SQLITE_CORRUPT, SQLITE_NOTADB:
+            return .corrupted(message)
+        default:
+            return .inconclusive(message)
+        }
     }
 
     private static func sidecarURL(for databaseURL: URL, suffix: String) -> URL {

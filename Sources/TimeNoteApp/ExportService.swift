@@ -31,12 +31,27 @@ struct ExportService {
     func makeCurrentTabCopyContent(tab: TabItem, entries: [LogEntry]) -> String {
         switch tab.kind {
         case .mainLog:
-            return entries
-                .map { "\(TimeFormats.clockString(from: $0.recordedAt)) \($0.noteText)" }
-                .joined(separator: "\n")
+            return logLines(for: entries).joined(separator: "\n")
         case .text:
             return tab.body
         }
+    }
+
+    /// 场记行。跨多天时在每天前插入日期分隔行，单日时保持原有 "HH:mm:ss 内容" 格式。
+    func logLines(for entries: [LogEntry]) -> [String] {
+        let groups = entries.groupedByDay(newestFirst: false)
+        let showsDayHeaders = groups.count > 1
+        var lines: [String] = []
+        for (index, group) in groups.enumerated() {
+            if showsDayHeaders {
+                if index > 0 {
+                    lines.append("")
+                }
+                lines.append("—— \(TimeFormats.shortDateString(from: group.day)) ——")
+            }
+            lines.append(contentsOf: group.entries.map { "\(TimeFormats.clockString(from: $0.recordedAt)) \($0.noteText)" })
+        }
+        return lines
     }
 
     func makeProjectExportContent(project: Project, tabs: [TabItem], entriesByTab: [String: [LogEntry]]) -> String {
@@ -49,8 +64,7 @@ struct ExportService {
             lines.append("========== [\(tab.title)] ==========")
             switch tab.kind {
             case .mainLog:
-                let rows = entriesByTab[tab.id, default: []]
-                    .map { "\(TimeFormats.clockString(from: $0.recordedAt)) \($0.noteText)" }
+                let rows = logLines(for: entriesByTab[tab.id, default: []])
                 if rows.isEmpty {
                     lines.append("")
                 } else {

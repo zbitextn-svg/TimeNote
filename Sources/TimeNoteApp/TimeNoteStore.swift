@@ -2,6 +2,19 @@ import AppKit
 import Foundation
 import SwiftUI
 
+/// 轻量提示条（替代"完成"类弹窗），可附带一个操作按钮，例如"撤销"。
+struct ToastMessage: Identifiable, Equatable {
+    enum Style: Equatable {
+        case success
+        case info
+    }
+
+    let id = UUID()
+    let text: String
+    let style: Style
+    let actionTitle: String?
+}
+
 @MainActor
 final class TimeNoteStore: ObservableObject {
     @Published private(set) var projects: [Project] = []
@@ -11,9 +24,18 @@ final class TimeNoteStore: ObservableObject {
     @Published private(set) var entries: [LogEntry] = []
     @Published var selectedProjectID: String?
     @Published var selectedTabID: String?
-    @Published var entryInputText = ""
+    /// 主场记输入框内容。从空变为非空时锁定时间戳（见 `pendingEntryStartedAt`）。
+    @Published var entryInputText = "" {
+        didSet { syncPendingEntryStart() }
+    }
+    /// 当前这条场记的时间戳：用户开始输入的时刻，提交时使用；输入清空后重置。
+    @Published private(set) var pendingEntryStartedAt: Date?
     @Published var currentTextTabBody = ""
     @Published var highlightedEntryID: String?
+    @Published var highlightedAttachmentID: String?
+    @Published var isAttachmentPanelPresented = false
+    @Published private(set) var projectStats: [String: ProjectEntryStats] = [:]
+    @Published private(set) var toast: ToastMessage?
     @Published var inputFocusNonce = 0
     @Published private(set) var submissionFeedbackToken = 0
     @Published private(set) var shouldForceLatestScroll = false
@@ -24,10 +46,14 @@ final class TimeNoteStore: ObservableObject {
     @Published var startupNotice: String?
     @Published var searchQuery = ""
     @Published private(set) var searchResults: [SearchResult] = []
+    /// 搜索防抖等待中（用于显示"搜索中"而不是闪一下"没有结果"）
+    @Published private(set) var isSearchPending = false
     @Published private(set) var isWindowPinned: Bool
 
     private let database: SQLiteDatabase
-    private let attachmentService = AttachmentService()
+    private let attachmentService: AttachmentService
+    private var toastAction: (() -> Void)?
+    private var toastDismissTask: Task<Void, Never>?
     private let exportService = ExportService()
     private let windowService = WindowService()
     private var textAutosaveTasks: [String: Task<Void, Never>] = [:]
@@ -42,13 +68,18 @@ final class TimeNoteStore: ObservableObject {
     private enum Timing {
         static let searchDebounce = Duration.milliseconds(220)
         static let textTabAutosave = Duration.milliseconds(350)
-        static let highlightDuration = Duration.seconds(1.2)
+        static let highlightDuration = Duration.seconds(1.6)
+        static let toastDuration = Duration.seconds(3)
+        static let undoToastDuration = Duration.seconds(6)
     }
 
-    init() {
+    /// - Parameter rootDirectory: 数据目录。传 nil 时使用默认目录（可被 `TIMENOTE_DATA_DIR` 覆盖）。
+    ///   测试应传入临时目录，避免读写真实数据。
+    init(rootDirectory: URL? = nil) {
         isWindowPinned = UserDefaults.standard.bool(forKey: Self.windowPinnedDefaultsKey)
+        attachmentService = AttachmentService(rootURL: rootDirectory)
         do {
-            let initialized = try Self.makeDatabase()
+            let initialized = try Self.makeDatabase(rootDirectory: rootDirectory)
             database = initialized.database
             startupNotice = initialized.notice
             if let recovery = initialized.recovery {
@@ -60,6 +91,11 @@ final class TimeNoteStore: ObservableObject {
                 appendStartupNotice("自动备份未完成：\(error.localizedDescription)")
             }
             windowService.setAlwaysOnTop(isWindowPinned)
+            #if DEBUG
+            if ProcessInfo.processInfo.environment["TIMENOTE_DEMO_SEED"] == "1" {
+                try DemoData.seedIfNeeded(database)
+            }
+            #endif
             try reloadAll()
         } catch {
             fatalError("TimeNote 初始化失败：\(error.localizedDescription)")
@@ -81,11 +117,27 @@ final class TimeNoteStore: ObservableObject {
     }
 
     var latestEntry: LogEntry? {
-        entries.last
+        entries.max { lhs, rhs in
+            lhs.createdAt < rhs.createdAt
+        }
     }
 
     var displayedEntries: [LogEntry] {
         Array(entries.reversed())
+    }
+
+    /// 按日期分组、最新在前，供主场记列表显示。
+    var displayedDayGroups: [LogDayGroup] {
+        entries.groupedByDay(newestFirst: true)
+    }
+
+    var selectedProjectStats: ProjectEntryStats? {
+        guard let selectedProjectID else { return nil }
+        return projectStats[selectedProjectID]
+    }
+
+    func stats(for projectID: String) -> ProjectEntryStats? {
+        projectStats[projectID]
     }
 
     var currentTextTabIsSaving: Bool {
@@ -166,8 +218,11 @@ final class TimeNoteStore: ObservableObject {
             let wasSelected = selectedProjectID == id
             let projectTabs = try database.fetchTabs(projectID: id)
             clearTextState(for: projectTabs.map(\.id))
-            try attachmentService.deleteProjectAttachmentDirectory(projectID: id)
+            // 先删数据库记录（事务内），成功后再删附件文件；
+            // 反过来的话，数据库删除失败会留下"记录还在、文件已没"的残缺项目。
             try database.deleteProject(id: id)
+            try? attachmentService.deleteProjectAttachmentDirectory(projectID: id)
+            UserDefaults.standard.removeObject(forKey: inputHistoryDefaultsKey(projectID: id))
             try reloadAll()
             if wasSelected {
                 selectProject(id: projects.first?.id ?? archivedProjects.first?.id)
@@ -264,6 +319,27 @@ final class TimeNoteStore: ObservableObject {
         refreshEntries()
     }
 
+    /// ⌘1…⌘9 切换标签
+    func selectTab(atIndex index: Int) {
+        guard tabs.indices.contains(index) else { return }
+        selectTab(id: tabs[index].id)
+    }
+
+    /// 回到主场记并聚焦输入框（⌘L）
+    func focusMainLogInput() {
+        if let mainTab = tabs.first(where: { $0.kind == .mainLog }), selectedTabID != mainTab.id {
+            selectTab(id: mainTab.id)
+        } else {
+            inputFocusNonce += 1
+        }
+    }
+
+    /// 把锁定的时间戳刷新为当前时间
+    func resetPendingEntryTime() {
+        guard pendingEntryStartedAt != nil else { return }
+        pendingEntryStartedAt = Date()
+    }
+
     func submitMainLogEntry() {
         guard
             let selectedProjectID,
@@ -275,21 +351,24 @@ final class TimeNoteStore: ObservableObject {
         let trimmed = entryInputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        let recordedAt = pendingEntryStartedAt ?? Date()
         performDatabaseUpdate {
             try database.insertLogEntry(
                 projectID: selectedProjectID,
                 tabID: mainTab.id,
-                recordedAt: Date(),
+                recordedAt: recordedAt,
                 noteText: trimmed
             )
             recordInputHistory(trimmed)
             entryInputText = ""
+            pendingEntryStartedAt = nil
             inputHistoryIndex = nil
             shouldForceLatestScroll = true
             lastSubmittedNote = trimmed
-            lastSubmittedAt = .now
+            lastSubmittedAt = recordedAt
             submissionFeedbackToken += 1
             refreshEntries()
+            refreshProjectStats()
             inputFocusNonce += 1
         }
     }
@@ -324,7 +403,16 @@ final class TimeNoteStore: ObservableObject {
     }
 
     func updateEntry(_ entryID: String, timeText: String, noteText: String) {
-        guard let existing = entries.first(where: { $0.id == entryID }) else { return }
+        // 从数据库读取原记录，而不是依赖当前显示的 entries：
+        // 编辑中途切换项目时，行视图在消失前才保存，此时 entries 已是新项目的数据。
+        let existing: LogEntry
+        do {
+            guard let fetched = try database.fetchEntry(id: entryID) else { return }
+            existing = fetched
+        } catch {
+            transientError = error.localizedDescription
+            return
+        }
         guard let updatedDate = TimeFormats.parseClock(timeText, relativeTo: existing.recordedAt) else {
             transientError = "时间格式应为 HH:mm:ss"
             return
@@ -335,18 +423,54 @@ final class TimeNoteStore: ObservableObject {
             transientError = "记录内容不能为空"
             return
         }
+        let timeChanged = TimeFormats.clockString(from: updatedDate) != TimeFormats.clockString(from: existing.recordedAt)
+        guard timeChanged || trimmed != existing.noteText else { return }
 
         performDatabaseUpdate {
-            try database.updateLogEntry(id: entryID, recordedAt: updatedDate, noteText: trimmed)
-            refreshEntries()
-            highlightedEntryID = entryID
-            Task { @MainActor in
-                try? await Task.sleep(for: Timing.highlightDuration)
-                if highlightedEntryID == entryID {
-                    highlightedEntryID = nil
-                }
+            try database.updateLogEntry(id: entryID, recordedAt: timeChanged ? updatedDate : existing.recordedAt, noteText: trimmed)
+            if existing.projectID == selectedProjectID {
+                refreshEntries()
+            }
+            refreshProjectStats()
+            // 只有时间被修改（可能重新排序）时才高亮并定位；改文字时不打扰正在编辑的用户
+            if timeChanged, existing.projectID == selectedProjectID {
+                highlightEntry(entryID)
             }
         }
+    }
+
+    func deleteEntry(_ entryID: String) {
+        performDatabaseUpdate {
+            guard let entry = try database.fetchEntry(id: entryID) else { return }
+            try database.deleteLogEntry(id: entryID)
+            if entry.projectID == selectedProjectID {
+                refreshEntries()
+            }
+            refreshProjectStats()
+            showToast(
+                "已删除 \(TimeFormats.clockString(from: entry.recordedAt)) 的场记",
+                style: .info,
+                actionTitle: "撤销"
+            ) { [weak self] in
+                self?.restoreDeletedEntry(entry)
+            }
+        }
+    }
+
+    private func restoreDeletedEntry(_ entry: LogEntry) {
+        performDatabaseUpdate {
+            try database.restoreLogEntry(entry)
+            if entry.projectID == selectedProjectID {
+                refreshEntries()
+                highlightEntry(entry.id)
+            }
+            refreshProjectStats()
+        }
+    }
+
+    func copyEntry(_ entry: LogEntry) {
+        exportService.copyToPasteboard("\(TimeFormats.clockString(from: entry.recordedAt)) \(entry.noteText)")
+        showToast("已复制这条场记", style: .success)
     }
 
     func updateCurrentTextTabBody(_ body: String) {
@@ -372,6 +496,7 @@ final class TimeNoteStore: ObservableObject {
                 content = exportService.makeCurrentTabCopyContent(tab: resolvedTab, entries: [])
             }
             exportService.copyToPasteboard(content)
+            showToast("已复制“\(tab.title)”的全部内容", style: .success)
         } catch {
             transientError = error.localizedDescription
         }
@@ -394,7 +519,7 @@ final class TimeNoteStore: ObservableObject {
                 entriesByTab: entriesByTab
             )
             if let exportedURL = try exportService.export(content: content, suggestedFileName: project.title) {
-                transientNotice = "已导出到 \(exportedURL.path)"
+                showToast("已导出：\(exportedURL.lastPathComponent)", style: .success)
             }
         } catch {
             transientError = error.localizedDescription
@@ -404,9 +529,9 @@ final class TimeNoteStore: ObservableObject {
     func createManualBackup() {
         performDatabaseUpdate {
             if let backupURL = try database.createBackupIfNeeded(force: true, minimumInterval: 0) {
-                transientNotice = "已创建备份：\(backupURL.lastPathComponent)"
+                showToast("已创建备份：\(backupURL.lastPathComponent)", style: .success)
             } else {
-                transientNotice = "当前无需创建新的备份。"
+                showToast("当前无需创建新的备份", style: .info)
             }
         }
     }
@@ -445,6 +570,17 @@ final class TimeNoteStore: ObservableObject {
                 throw error
             }
             refreshCurrentProject()
+            isAttachmentPanelPresented = true
+            showToast(importedFiles.count == 1 ? "已导入附件“\(importedFiles[0].fileName)”" : "已导入 \(importedFiles.count) 个附件", style: .success)
+        }
+    }
+
+    func revealAttachment(_ attachment: AttachmentItem) {
+        do {
+            let url = try attachmentService.attachmentURL(relativePath: attachment.relativePath)
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            transientError = error.localizedDescription
         }
     }
 
@@ -473,9 +609,11 @@ final class TimeNoteStore: ObservableObject {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else {
             searchResults = []
+            isSearchPending = false
             return
         }
 
+        isSearchPending = true
         searchTask = Task { @MainActor in
             try? await Task.sleep(for: Timing.searchDebounce)
             guard Task.isCancelled == false else { return }
@@ -484,6 +622,7 @@ final class TimeNoteStore: ObservableObject {
             } catch {
                 transientError = error.localizedDescription
             }
+            isSearchPending = false
         }
     }
 
@@ -491,6 +630,7 @@ final class TimeNoteStore: ObservableObject {
         searchTask?.cancel()
         searchQuery = ""
         searchResults = []
+        isSearchPending = false
     }
 
     func highlightEntryInList(_ entryID: String) {
@@ -566,7 +706,15 @@ final class TimeNoteStore: ObservableObject {
         if let attachmentID = result.attachmentID,
            let attachment = attachments.first(where: { $0.id == attachmentID }) {
             highlightedEntryID = nil
-            transientError = "已定位到附件“\(attachment.fileName)”。如需打开，请在附件区点击。"
+            isAttachmentPanelPresented = true
+            highlightedAttachmentID = attachmentID
+            showToast("已定位到附件“\(attachment.fileName)”", style: .info)
+            Task { @MainActor in
+                try? await Task.sleep(for: Timing.highlightDuration)
+                if highlightedAttachmentID == attachmentID {
+                    highlightedAttachmentID = nil
+                }
+            }
         }
 
         clearSearch()
@@ -600,6 +748,59 @@ final class TimeNoteStore: ObservableObject {
     private func reloadProjectCollections() throws {
         projects = try database.fetchProjects()
         archivedProjects = try database.fetchArchivedProjects()
+        projectStats = try database.fetchEntryStats()
+    }
+
+    private func refreshProjectStats() {
+        do {
+            projectStats = try database.fetchEntryStats()
+        } catch {
+            transientError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Toast
+
+    func showToast(
+        _ text: String,
+        style: ToastMessage.Style = .success,
+        actionTitle: String? = nil,
+        action: (() -> Void)? = nil
+    ) {
+        toastDismissTask?.cancel()
+        toastAction = action
+        let message = ToastMessage(text: text, style: style, actionTitle: action == nil ? nil : actionTitle)
+        toast = message
+        let duration = action == nil ? Timing.toastDuration : Timing.undoToastDuration
+        toastDismissTask = Task { @MainActor in
+            try? await Task.sleep(for: duration)
+            guard Task.isCancelled == false else { return }
+            if toast?.id == message.id {
+                toast = nil
+                toastAction = nil
+            }
+        }
+    }
+
+    func performToastAction() {
+        let action = toastAction
+        dismissToast()
+        action?()
+    }
+
+    func dismissToast() {
+        toastDismissTask?.cancel()
+        toast = nil
+        toastAction = nil
+    }
+
+    private func syncPendingEntryStart() {
+        let hasContent = entryInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        if hasContent, pendingEntryStartedAt == nil {
+            pendingEntryStartedAt = Date()
+        } else if hasContent == false, pendingEntryStartedAt != nil {
+            pendingEntryStartedAt = nil
+        }
     }
 
     private func refreshCurrentProject() {
@@ -764,8 +965,8 @@ final class TimeNoteStore: ObservableObject {
         }
     }
 
-    private static func makeDatabase() throws -> (database: SQLiteDatabase, recovery: LaunchRecoveryResult?, notice: String?) {
-        let databaseURL = try SQLiteDatabase.defaultDatabaseURL()
+    private static func makeDatabase(rootDirectory: URL?) throws -> (database: SQLiteDatabase, recovery: LaunchRecoveryResult?, notice: String?) {
+        let databaseURL = try rootDirectory.map { AppPaths.databaseURL(in: $0) } ?? SQLiteDatabase.defaultDatabaseURL()
         do {
             let launchRecovery = try RecoveryService.prepareDatabaseForLaunch(at: databaseURL)
             let database = try SQLiteDatabase(path: databaseURL)

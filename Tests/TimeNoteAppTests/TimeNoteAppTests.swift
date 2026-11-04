@@ -11,9 +11,10 @@ func parseClockKeepsSameDay() throws {
 
 @Test
 func parseClockCrossesMidnightToNearestDay() throws {
-    let original = try #require(TimeFormats.iso8601Date(from: "2026-04-16T15:58:30.000Z"))
-    let parsed = try #require(TimeFormats.parseClock("00:05:00", relativeTo: original))
+    // 用本地时区构造 23:58:30，避免测试结果依赖运行机器的时区（原写法只在 UTC+8 下成立）
     let calendar = Calendar.current
+    let original = try #require(calendar.date(from: DateComponents(year: 2026, month: 4, day: 16, hour: 23, minute: 58, second: 30)))
+    let parsed = try #require(TimeFormats.parseClock("00:05:00", relativeTo: original))
 
     #expect(TimeFormats.clockString(from: parsed) == "00:05:00")
     #expect(calendar.component(.day, from: parsed) != calendar.component(.day, from: original))
@@ -192,6 +193,12 @@ private func makeTestDatabaseURL() throws -> URL {
     return root.appendingPathComponent("timenote-test.sqlite")
 }
 
+/// 使用临时数据目录的 store，绝不读写真实的 ~/Library/Application Support/TimeNote
+@MainActor
+private func makeIsolatedStore() throws -> TimeNoteStore {
+    TimeNoteStore(rootDirectory: try makeTemporaryDirectory())
+}
+
 private func makeTemporaryDirectory() throws -> URL {
     let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -204,7 +211,7 @@ private func makeTemporaryDirectory() throws -> URL {
 @MainActor
 @Test
 func test_selectProject_clearsEntryInputText() throws {
-    let store = TimeNoteStore()
+    let store = try makeIsolatedStore()
     store.createProject()
     let projectA = try #require(store.selectedProjectID)
     store.createProject()
@@ -225,7 +232,7 @@ func test_selectProject_clearsEntryInputText() throws {
 @MainActor
 @Test
 func test_selectProject_flushesPendingTextDraftsBeforeSwitch() throws {
-    let store = TimeNoteStore()
+    let store = try makeIsolatedStore()
     store.createProject()
     let projectA = try #require(store.selectedProjectID)
     let textTabA = try #require(store.addTextTab())
@@ -247,7 +254,7 @@ func test_selectProject_flushesPendingTextDraftsBeforeSwitch() throws {
 @MainActor
 @Test
 func test_selectTab_flushesOldTabDraftBeforeSwitch() throws {
-    let store = TimeNoteStore()
+    let store = try makeIsolatedStore()
     store.createProject()
     let projectID = try #require(store.selectedProjectID)
     defer { store.deleteProject(id: projectID) }
@@ -269,7 +276,7 @@ func test_selectTab_flushesOldTabDraftBeforeSwitch() throws {
 @MainActor
 @Test
 func test_flushTextTabDraft_synchronizesWriteAndClearsDraft() throws {
-    let store = TimeNoteStore()
+    let store = try makeIsolatedStore()
     store.createProject()
     let projectID = try #require(store.selectedProjectID)
     defer { store.deleteProject(id: projectID) }
@@ -295,7 +302,7 @@ func test_flushTextTabDraft_synchronizesWriteAndClearsDraft() throws {
 @MainActor
 @Test
 func test_flushAllPendingEdits_isIdempotent() throws {
-    let store = TimeNoteStore()
+    let store = try makeIsolatedStore()
     store.createProject()
     let projectID = try #require(store.selectedProjectID)
     let tabID = try #require(store.addTextTab())
@@ -317,7 +324,7 @@ func test_flushAllPendingEdits_isIdempotent() throws {
 @MainActor
 @Test
 func test_flushPendingProjectRename_supportsExplicitProjectID() throws {
-    let store = TimeNoteStore()
+    let store = try makeIsolatedStore()
     store.createProject()
     let projectA = try #require(store.selectedProjectID)
     store.createProject()
@@ -342,7 +349,7 @@ func test_flushPendingProjectRename_supportsExplicitProjectID() throws {
 @MainActor
 @Test
 func test_rapidTabSwitching_preservesAllDrafts() throws {
-    let store = TimeNoteStore()
+    let store = try makeIsolatedStore()
     store.createProject()
     let projectID = try #require(store.selectedProjectID)
     defer { store.deleteProject(id: projectID) }
@@ -369,4 +376,178 @@ func test_rapidTabSwitching_preservesAllDrafts() throws {
     let savedTabB = store.tabs.first(where: { $0.id == tabB })
     #expect(savedTabA?.body == "A-2")
     #expect(savedTabB?.body == "B-2")
+}
+
+
+// MARK: - v22 回归测试
+
+@Test
+func searchFindsChineseSubstringsInLogEntriesAndTextTabs() throws {
+    let database = try makeTestDatabase()
+    let project = try database.createProject(title: "外景")
+    let mainTab = try #require(try database.fetchMainTab(projectID: project.id))
+    try database.insertLogEntry(projectID: project.id, tabID: mainTab.id, recordedAt: .now, noteText: "24-2-1 演员抢词，重来")
+    let textTab = try database.createTextTab(projectID: project.id, title: "备忘")
+    try database.updateTabBody(tabID: textTab.id, body: "明天需要准备道具自行车")
+
+    // FTS5 unicode61 会把连续汉字当成整词，旧实现搜不到这些子串
+    let entryResults = try database.search(query: "演员")
+    #expect(entryResults.contains(where: { $0.kind == .logEntry }))
+
+    let bodyResults = try database.search(query: "自行车")
+    #expect(bodyResults.contains(where: { $0.kind == .tabBody && $0.tabID == textTab.id }))
+
+    // 多关键词为"且"关系
+    #expect(try database.search(query: "24-2 抢词").contains(where: { $0.kind == .logEntry }))
+    #expect(try database.search(query: "24-2 不存在").contains(where: { $0.kind == .logEntry }) == false)
+
+    // LIKE 通配符需要被转义
+    #expect(try database.search(query: "%").isEmpty)
+}
+
+@Test
+func nestedTransactionsUseSavepoints() throws {
+    let database = try makeTestDatabase()
+    // duplicateProject 内部会再调用 createProject / insertLogEntry 等自带事务的方法
+    let project = try database.createProject(title: "嵌套事务")
+    let mainTab = try #require(try database.fetchMainTab(projectID: project.id))
+    try database.insertLogEntry(projectID: project.id, tabID: mainTab.id, recordedAt: .now, noteText: "第一条")
+
+    let copy = try database.performTransaction {
+        try database.duplicateProject(id: project.id)
+    }
+    let copiedTab = try #require(try database.fetchMainTab(projectID: copy.id))
+    #expect(try database.fetchEntries(projectID: copy.id, tabID: copiedTab.id).count == 1)
+
+    // 内层失败只回滚内层
+    struct Boom: Error {}
+    try database.performTransaction {
+        _ = try? database.performTransaction { () throws -> Void in
+            try database.insertLogEntry(projectID: project.id, tabID: mainTab.id, recordedAt: .now, noteText: "会被回滚")
+            throw Boom()
+        }
+        try database.insertLogEntry(projectID: project.id, tabID: mainTab.id, recordedAt: .now, noteText: "保留")
+    }
+    let notes = try database.fetchEntries(projectID: project.id, tabID: mainTab.id).map(\.noteText)
+    #expect(notes.contains("保留"))
+    #expect(notes.contains("会被回滚") == false)
+}
+
+@Test
+func deletedLogEntryCanBeRestoredWithOriginalTime() throws {
+    let database = try makeTestDatabase()
+    let project = try database.createProject(title: "删除恢复")
+    let mainTab = try #require(try database.fetchMainTab(projectID: project.id))
+    let recordedAt = try #require(TimeFormats.iso8601Date(from: "2026-04-16T08:09:10.000Z"))
+    let entry = try #require(try database.insertLogEntry(projectID: project.id, tabID: mainTab.id, recordedAt: recordedAt, noteText: "要删的"))
+
+    try database.deleteLogEntry(id: entry.id)
+    #expect(try database.fetchEntry(id: entry.id) == nil)
+    #expect(try database.search(query: "要删的").isEmpty)
+
+    try database.restoreLogEntry(entry)
+    let restored = try #require(try database.fetchEntry(id: entry.id))
+    #expect(restored.recordedAt == recordedAt)
+    #expect(restored.noteText == "要删的")
+}
+
+@Test
+func entryStatsCountPerProject() throws {
+    let database = try makeTestDatabase()
+    let project = try database.createProject(title: "统计")
+    let mainTab = try #require(try database.fetchMainTab(projectID: project.id))
+    try database.insertLogEntry(projectID: project.id, tabID: mainTab.id, recordedAt: .now, noteText: "一")
+    try database.insertLogEntry(projectID: project.id, tabID: mainTab.id, recordedAt: .now, noteText: "二")
+
+    let stats = try database.fetchEntryStats()
+    #expect(stats[project.id]?.entryCount == 2)
+    #expect(stats[project.id]?.lastRecordedAt != nil)
+}
+
+@Test
+func integrityCheckDoesNotQuarantineHealthyDatabase() throws {
+    let databaseURL = try makeTestDatabaseURL()
+    let database = try SQLiteDatabase(path: databaseURL)
+    _ = try database.createProject(title: "健康的数据库")
+
+    #expect(RecoveryService.checkIntegrity(at: databaseURL) == .ok)
+    #expect(try RecoveryService.prepareDatabaseForLaunch(at: databaseURL) == nil)
+    #expect(FileManager.default.fileExists(atPath: databaseURL.path))
+}
+
+@Test
+func exportAddsDayHeadersOnlyWhenEntriesSpanMultipleDays() throws {
+    let service = ExportService()
+    let day1 = try #require(TimeFormats.iso8601Date(from: "2026-04-16T04:00:00.000Z"))
+    let day2 = day1.addingTimeInterval(24 * 60 * 60)
+    func entry(_ date: Date, _ text: String) -> LogEntry {
+        LogEntry(id: UUID().uuidString, projectID: "p", tabID: "t", recordedAt: date, noteText: text, createdAt: date, updatedAt: date)
+    }
+
+    let singleDay = service.logLines(for: [entry(day1, "A"), entry(day1.addingTimeInterval(60), "B")])
+    #expect(singleDay.count == 2)
+    #expect(singleDay.allSatisfy { $0.hasPrefix("——") == false })
+
+    let multiDay = service.logLines(for: [entry(day2, "C"), entry(day1, "A")])
+    #expect(multiDay.first?.hasPrefix("——") == true)
+    #expect(multiDay.contains { $0.hasSuffix(" A") })
+    #expect(multiDay.firstIndex { $0.hasSuffix(" A") }! < multiDay.firstIndex { $0.hasSuffix(" C") }!)
+}
+
+@MainActor
+@Test
+func submittedEntryUsesTimeWhenTypingStarted() throws {
+    let store = try makeIsolatedStore()
+    store.createProject()
+
+    store.entryInputText = "开始打字"
+    let lockedAt = try #require(store.pendingEntryStartedAt)
+    store.entryInputText = "开始打字，继续输入了很久"
+    #expect(store.pendingEntryStartedAt == lockedAt)
+
+    store.submitMainLogEntry()
+    #expect(store.pendingEntryStartedAt == nil)
+    let saved = try #require(store.entries.last)
+    #expect(abs(saved.recordedAt.timeIntervalSince(lockedAt)) < 0.001)
+
+    store.entryInputText = "临时"
+    #expect(store.pendingEntryStartedAt != nil)
+    store.entryInputText = ""
+    #expect(store.pendingEntryStartedAt == nil)
+}
+
+@MainActor
+@Test
+func deleteEntryCanBeUndoneFromToast() throws {
+    let store = try makeIsolatedStore()
+    store.createProject()
+    store.entryInputText = "误记的一条"
+    store.submitMainLogEntry()
+    let entryID = try #require(store.entries.first?.id)
+
+    store.deleteEntry(entryID)
+    #expect(store.entries.isEmpty)
+    #expect(store.toast?.actionTitle == "撤销")
+
+    store.performToastAction()
+    #expect(store.entries.map(\.id) == [entryID])
+}
+
+@MainActor
+@Test
+func updateEntrySavesEvenAfterSwitchingProject() throws {
+    let store = try makeIsolatedStore()
+    store.createProject()
+    let projectA = try #require(store.selectedProjectID)
+    store.entryInputText = "原始内容"
+    store.submitMainLogEntry()
+    let entry = try #require(store.entries.first)
+
+    // 模拟：编辑中途切到另一个项目，行视图在消失时才提交保存
+    store.createProject()
+    #expect(store.selectedProjectID != projectA)
+    store.updateEntry(entry.id, timeText: TimeFormats.clockString(from: entry.recordedAt), noteText: "修改后的内容")
+
+    store.selectProject(id: projectA)
+    #expect(store.entries.first?.noteText == "修改后的内容")
 }

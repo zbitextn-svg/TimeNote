@@ -2,12 +2,15 @@
 
 ## 项目
 
-macOS 14+ 原生 SwiftUI 应用；Swift 6.3、Swift 6 language mode；Swift Package Manager；系统 SQLite3。优先阅读 README.md 与 Package.swift。
+macOS 14+ 原生 SwiftUI 应用；Swift 6.1+（swift-tools-version 6.1）、Swift 6 language mode；Swift Package Manager；系统 SQLite3。优先阅读 README.md 与 Package.swift。
 
 ## 架构入口
 
 - TimeNoteApp.swift：应用入口、菜单和通知。
 - ContentView.swift：SwiftUI 视图。
+- Theme.swift：颜色、圆角、字体等设计 token 与通用小组件。
+- AppPaths.swift：数据目录（支持 TIMENOTE_DATA_DIR 覆盖）。
+- DemoData.swift：DEBUG 演示数据（TIMENOTE_DEMO_SEED=1）。
 - TimeNoteStore.swift：@MainActor 状态与业务协调。
 - SQLiteDatabase.swift：表结构、迁移、CRUD、搜索、事务。
 - Models.swift：模型及时间处理。
@@ -24,7 +27,7 @@ macOS 14+ 原生 SwiftUI 应用；Swift 6.3、Swift 6 language mode；Swift Pack
 
 ## 数据兼容
 
-应用默认访问 ~/Library/Application Support/TimeNote/，开发运行也可能使用真实数据。未经用户授权，不删除、重置或迁移其真实数据库。优先使用临时目录进行存储测试。
+应用默认访问 ~/Library/Application Support/TimeNote/，开发运行也可能使用真实数据；开发时请设置 TIMENOTE_DATA_DIR 指向临时目录。测试中的 TimeNoteStore 必须传入临时 rootDirectory。未经用户授权，不删除、重置或迁移其真实数据库。优先使用临时目录进行存储测试。
 
 数据库改动保持旧数据兼容，必要时增加迁移，并覆盖已有数据的读取与升级。保留事务及备份恢复行为。注意日志时间跨日、文本草稿保存和窗口失活时的保存。
 
