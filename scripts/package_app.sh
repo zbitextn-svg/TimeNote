@@ -1,0 +1,87 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+APP_NAME="TimeNoteApp"
+# 支持环境变量覆盖，例如: BUNDLE_NAME=TimeNoteV21 bash scripts/package_app.sh
+BUNDLE_NAME="${BUNDLE_NAME:-TimeNoteV20}"
+BUILD_DIR="$ROOT_DIR/.build/arm64-apple-macosx/release"
+EXECUTABLE="$BUILD_DIR/$APP_NAME"
+DIST_DIR="$ROOT_DIR/dist"
+APP_DIR="$DIST_DIR/$BUNDLE_NAME.app"
+CONTENTS_DIR="$APP_DIR/Contents"
+MACOS_DIR="$CONTENTS_DIR/MacOS"
+RESOURCES_DIR="$CONTENTS_DIR/Resources"
+ZIP_PATH="$DIST_DIR/$BUNDLE_NAME.zip"
+APPICONSET_DIR="$ROOT_DIR/Sources/TimeNoteApp/Assets.xcassets/AppIcon.appiconset"
+ICONSET_TMP_DIR="$DIST_DIR/AppIcon.iconset"
+ICON_PATH="$RESOURCES_DIR/AppIcon.icns"
+
+# 图标 PNG 已存在时跳过生成（避免沙箱拦截 swift 子进程的文件覆盖）
+if [[ ! -f "$APPICONSET_DIR/icon_512x512@2x.png" ]]; then
+  swift "$ROOT_DIR/scripts/generate_app_icon.swift" "$ROOT_DIR"
+fi
+swift build -c release
+
+rm -rf "$APP_DIR"
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
+
+cp "$EXECUTABLE" "$MACOS_DIR/$APP_NAME"
+
+rm -rf "$ICONSET_TMP_DIR"
+mkdir -p "$ICONSET_TMP_DIR"
+cp "$APPICONSET_DIR"/*.png "$ICONSET_TMP_DIR/"
+iconutil -c icns "$ICONSET_TMP_DIR" -o "$ICON_PATH"
+rm -rf "$ICONSET_TMP_DIR"
+
+cat > "$CONTENTS_DIR/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>zh_CN</string>
+  <key>CFBundleExecutable</key>
+  <string>TimeNoteApp</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.frey.TimeNoteApp</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleDisplayName</key>
+  <string>${BUNDLE_NAME}</string>
+  <key>CFBundleName</key>
+  <string>${BUNDLE_NAME}</string>
+  <key>CFBundleGetInfoString</key>
+  <string>${BUNDLE_NAME} 0.1.0, Copyright 2026 frey</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.productivity</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright 2026 frey</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>14.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+
+printf 'APPL????' > "$CONTENTS_DIR/PkgInfo"
+
+codesign --force --deep --sign - "$APP_DIR"
+
+rm -f "$ZIP_PATH"
+ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
+
+echo "Packaged app: $APP_DIR"
+echo "Packaged zip: $ZIP_PATH"
+echo "Bundle display name: $BUNDLE_NAME"
