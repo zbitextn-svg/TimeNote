@@ -162,13 +162,7 @@ struct AttachmentService {
         if let rootURL {
             return rootURL
         }
-        let root = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        return root.appendingPathComponent("TimeNote", isDirectory: true)
+        return try AppPaths.rootDirectory()
     }
 
     private func sanitizeFileName(_ fileName: String) -> String {

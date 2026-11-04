@@ -23,6 +23,11 @@ struct TabItem: Identifiable, Equatable {
     var body: String
 }
 
+struct ProjectEntryStats: Equatable {
+    let entryCount: Int
+    let lastRecordedAt: Date?
+}
+
 struct LogEntry: Identifiable, Equatable {
     let id: String
     let projectID: String
@@ -93,6 +98,37 @@ enum SearchResultKind: String, Equatable {
             return "附件"
         }
     }
+
+    var systemImageName: String {
+        switch self {
+        case .project:
+            return "folder"
+        case .tabTitle:
+            return "rectangle.on.rectangle"
+        case .tabBody:
+            return "doc.text"
+        case .logEntry:
+            return "clock"
+        case .attachment:
+            return "paperclip"
+        }
+    }
+
+    /// 搜索结果分组顺序：先导航型（项目、标签），再内容型。
+    var sortRank: Int {
+        switch self {
+        case .project:
+            return 0
+        case .tabTitle:
+            return 1
+        case .logEntry:
+            return 2
+        case .tabBody:
+            return 3
+        case .attachment:
+            return 4
+        }
+    }
 }
 
 struct SearchResult: Identifiable, Equatable {
@@ -122,7 +158,8 @@ enum TimeFormats {
     private static func makeClockFormatter() -> DateFormatter {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "zh_CN")
-        formatter.timeZone = .current
+        // 跟随系统时区变化（外景跨时区拍摄时不需要重启应用）
+        formatter.timeZone = .autoupdatingCurrent
         formatter.dateFormat = "HH:mm:ss"
         return formatter
     }
@@ -130,7 +167,7 @@ enum TimeFormats {
     private static func makeShortDateFormatter() -> DateFormatter {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "zh_CN")
-        formatter.timeZone = .current
+        formatter.timeZone = .autoupdatingCurrent
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter
     }
@@ -178,6 +215,37 @@ enum TimeFormats {
         threadLocalShortDateFormatter().string(from: date)
     }
 
+    /// 场记列表中的日期分组标题，例如 "11月4日 周三"；不是今年时带上年份。
+    static func dayHeaderString(from date: Date, now: Date = .now) -> String {
+        let calendar = Calendar.autoupdatingCurrent
+        let weekdays = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+        let components = calendar.dateComponents([.year, .month, .day, .weekday], from: date)
+        let currentYear = calendar.component(.year, from: now)
+        let weekday = weekdays[((components.weekday ?? 1) - 1 + 7) % 7]
+        let dayText = "\(components.month ?? 0)月\(components.day ?? 0)日 \(weekday)"
+        if components.year != currentYear, let year = components.year {
+            return "\(year)年\(dayText)"
+        }
+        return dayText
+    }
+
+    /// 相对日期标签：今天 / 昨天，其它日期返回 nil。
+    static func relativeDayLabel(for date: Date, now: Date = .now) -> String? {
+        let calendar = Calendar.autoupdatingCurrent
+        if calendar.isDate(date, inSameDayAs: now) {
+            return "今天"
+        }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
+           calendar.isDate(date, inSameDayAs: yesterday) {
+            return "昨天"
+        }
+        return nil
+    }
+
+    static func startOfDay(for date: Date) -> Date {
+        Calendar.autoupdatingCurrent.startOfDay(for: date)
+    }
+
     static func parseClock(_ value: String, relativeTo original: Date) -> Date? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.split(separator: ":")
@@ -217,5 +285,47 @@ enum TimeFormats {
         return candidates.min { lhs, rhs in
             abs(lhs.timeIntervalSince(original)) < abs(rhs.timeIntervalSince(original))
         }
+    }
+}
+
+/// 按自然日分组的场记。
+struct LogDayGroup: Identifiable, Equatable {
+    let day: Date
+    let entries: [LogEntry]
+
+    var id: Date { day }
+}
+
+extension Array where Element == LogEntry {
+    /// 按记录时间所在的自然日分组；`newestFirst` 为 true 时日期和组内条目都倒序。
+    func groupedByDay(newestFirst: Bool) -> [LogDayGroup] {
+        var groups: [LogDayGroup] = []
+        var currentDay: Date?
+        var bucket: [LogEntry] = []
+        let ordered = newestFirst
+            ? sorted { $0.recordedAt > $1.recordedAt || ($0.recordedAt == $1.recordedAt && $0.createdAt > $1.createdAt) }
+            : sorted { $0.recordedAt < $1.recordedAt || ($0.recordedAt == $1.recordedAt && $0.createdAt < $1.createdAt) }
+
+        for entry in ordered {
+            let day = TimeFormats.startOfDay(for: entry.recordedAt)
+            if day != currentDay {
+                if let currentDay, bucket.isEmpty == false {
+                    groups.append(LogDayGroup(day: currentDay, entries: bucket))
+                }
+                currentDay = day
+                bucket = []
+            }
+            bucket.append(entry)
+        }
+        if let currentDay, bucket.isEmpty == false {
+            groups.append(LogDayGroup(day: currentDay, entries: bucket))
+        }
+        return groups
+    }
+
+    var spansMultipleDays: Bool {
+        guard let first else { return false }
+        let firstDay = TimeFormats.startOfDay(for: first.recordedAt)
+        return contains { TimeFormats.startOfDay(for: $0.recordedAt) != firstDay }
     }
 }

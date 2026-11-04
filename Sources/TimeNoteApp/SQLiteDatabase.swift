@@ -24,6 +24,7 @@ enum DatabaseError: LocalizedError {
 final class SQLiteDatabase {
     private let db: OpaquePointer
     private let path: URL
+    private var savepointCounter = 0
     private static let fullTextSchemaVersion = "3"
 
     init(path: URL) throws {
@@ -54,15 +55,7 @@ final class SQLiteDatabase {
     }
 
     static func defaultDatabaseURL() throws -> URL {
-        let root = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        return root
-            .appendingPathComponent("TimeNote", isDirectory: true)
-            .appendingPathComponent("timenote.sqlite")
+        AppPaths.databaseURL(in: try AppPaths.rootDirectory())
     }
 
     func createBackupIfNeeded(force: Bool = false, minimumInterval: TimeInterval = 6 * 60 * 60) throws -> URL? {
@@ -88,13 +81,13 @@ final class SQLiteDatabase {
             ? """
               SELECT id, title, is_archived, created_at, updated_at, archived_at
               FROM projects
-              ORDER BY created_at DESC
+              ORDER BY created_at DESC, rowid DESC
               """
             : """
               SELECT id, title, is_archived, created_at, updated_at, archived_at
               FROM projects
               WHERE is_archived = 0
-              ORDER BY created_at DESC
+              ORDER BY created_at DESC, rowid DESC
               """
 
         return try query(sql) { statement in
@@ -133,18 +126,26 @@ final class SQLiteDatabase {
         let now = Date()
         let id = UUID().uuidString
         let timestamp = TimeFormats.iso8601String(from: now)
-        try execute(
-            """
-            INSERT INTO projects (id, title, is_archived, created_at, updated_at)
-            VALUES (?, ?, 0, ?, ?)
-            """,
-            bindings: [.text(id), .text(title), .text(timestamp), .text(timestamp)]
-        )
-        try insertMainTab(projectID: id, now: now)
-        return try fetchProject(id: id)
+        return try performTransaction {
+            try execute(
+                """
+                INSERT INTO projects (id, title, is_archived, created_at, updated_at)
+                VALUES (?, ?, 0, ?, ?)
+                """,
+                bindings: [.text(id), .text(title), .text(timestamp), .text(timestamp)]
+            )
+            try insertMainTab(projectID: id, now: now)
+            return try fetchProject(id: id)
+        }
     }
 
     func duplicateProject(id: String) throws -> Project {
+        try performTransaction {
+            try duplicateProjectRows(id: id)
+        }
+    }
+
+    private func duplicateProjectRows(id: String) throws -> Project {
         let original = try fetchProject(id: id)
         let tabs = try fetchTabs(projectID: id)
         let entries = try fetchEntries(projectID: id, tabID: tabs.first(where: { $0.kind == .mainLog })?.id)
@@ -201,9 +202,11 @@ final class SQLiteDatabase {
     }
 
     func deleteProject(id: String) throws {
-        try execute("DELETE FROM log_entries_fts WHERE project_id = ?", bindings: [.text(id)])
-        try execute("DELETE FROM text_tabs_fts WHERE project_id = ?", bindings: [.text(id)])
-        try execute("DELETE FROM projects WHERE id = ?", bindings: [.text(id)])
+        try performTransaction {
+            try execute("DELETE FROM log_entries_fts WHERE project_id = ?", bindings: [.text(id)])
+            try execute("DELETE FROM text_tabs_fts WHERE project_id = ?", bindings: [.text(id)])
+            try execute("DELETE FROM projects WHERE id = ?", bindings: [.text(id)])
+        }
     }
 
     func renameProject(id: String, title: String) throws {
@@ -324,34 +327,41 @@ final class SQLiteDatabase {
     }
 
     func deleteTab(tabID: String) throws {
-        try execute("DELETE FROM text_tabs_fts WHERE tab_id = ?", bindings: [.text(tabID)])
-        try execute("DELETE FROM tabs WHERE id = ? AND kind = 'text'", bindings: [.text(tabID)])
+        try performTransaction {
+            try execute("DELETE FROM text_tabs_fts WHERE tab_id = ?", bindings: [.text(tabID)])
+            try execute("DELETE FROM tabs WHERE id = ? AND kind = 'text'", bindings: [.text(tabID)])
+        }
     }
 
     func updateTabOrder(projectID: String, orderedTabIDs: [String]) throws {
-        for (index, tabID) in orderedTabIDs.enumerated() {
-            try execute(
-                """
-                UPDATE tabs
-                SET sort_index = ?, updated_at = ?
-                WHERE id = ? AND project_id = ?
-                """,
-                bindings: [.int(index), .text(TimeFormats.iso8601String(from: Date())), .text(tabID), .text(projectID)]
-            )
+        let now = TimeFormats.iso8601String(from: Date())
+        try performTransaction {
+            for (index, tabID) in orderedTabIDs.enumerated() {
+                try execute(
+                    """
+                    UPDATE tabs
+                    SET sort_index = ?, updated_at = ?
+                    WHERE id = ? AND project_id = ?
+                    """,
+                    bindings: [.int(index), .text(now), .text(tabID), .text(projectID)]
+                )
+            }
         }
     }
 
     func updateTabBody(tabID: String, body: String) throws {
         let now = TimeFormats.iso8601String(from: Date())
-        try execute(
-            """
-            UPDATE tabs
-            SET body = ?, updated_at = ?
-            WHERE id = ? AND kind = 'text'
-            """,
-            bindings: [.text(body), .text(now), .text(tabID)]
-        )
-        try upsertTextTabSearchIndex(tabID: tabID)
+        try performTransaction {
+            try execute(
+                """
+                UPDATE tabs
+                SET body = ?, updated_at = ?
+                WHERE id = ? AND kind = 'text'
+                """,
+                bindings: [.text(body), .text(now), .text(tabID)]
+            )
+            try upsertTextTabSearchIndex(tabID: tabID)
+        }
     }
 
     func fetchTab(id: String) throws -> TabItem {
@@ -379,29 +389,62 @@ final class SQLiteDatabase {
     }
 
     func fetchEntries(projectID: String, tabID: String?) throws -> [LogEntry] {
-        if let tabID {
-            return try query(
-                """
-                SELECT id, project_id, tab_id, recorded_at, note_text, created_at, updated_at
-                FROM log_entries
-                WHERE project_id = ? AND tab_id = ?
-                ORDER BY recorded_at ASC, created_at ASC
-                """,
-                bindings: [.text(projectID), .text(tabID)]
-            ) { statement in
-                LogEntry(
-                    id: statement.text(at: 0),
-                    projectID: statement.text(at: 1),
-                    tabID: statement.text(at: 2),
-                    recordedAt: statement.date(at: 3),
-                    noteText: statement.text(at: 4),
-                    createdAt: statement.date(at: 5),
-                    updatedAt: statement.date(at: 6)
-                )
-            }
-        }
+        guard let tabID else { return [] }
+        return try query(
+            """
+            SELECT id, project_id, tab_id, recorded_at, note_text, created_at, updated_at
+            FROM log_entries
+            WHERE project_id = ? AND tab_id = ?
+            ORDER BY recorded_at ASC, created_at ASC
+            """,
+            bindings: [.text(projectID), .text(tabID)],
+            transform: Self.makeLogEntry
+        )
+    }
 
-        return []
+    func fetchEntry(id: String) throws -> LogEntry? {
+        try query(
+            """
+            SELECT id, project_id, tab_id, recorded_at, note_text, created_at, updated_at
+            FROM log_entries
+            WHERE id = ?
+            LIMIT 1
+            """,
+            bindings: [.text(id)],
+            transform: Self.makeLogEntry
+        ).first
+    }
+
+    /// 每个项目的场记条数与最近一条的时间，用于侧边栏摘要。
+    func fetchEntryStats() throws -> [String: ProjectEntryStats] {
+        let rows = try query(
+            """
+            SELECT project_id, COUNT(*), MAX(recorded_at)
+            FROM log_entries
+            GROUP BY project_id
+            """
+        ) { statement in
+            (
+                projectID: statement.text(at: 0),
+                stats: ProjectEntryStats(
+                    entryCount: statement.int(at: 1),
+                    lastRecordedAt: statement.optionalDate(at: 2)
+                )
+            )
+        }
+        return Dictionary(rows.map { ($0.projectID, $0.stats) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    private static func makeLogEntry(_ statement: SQLiteStatement) -> LogEntry {
+        LogEntry(
+            id: statement.text(at: 0),
+            projectID: statement.text(at: 1),
+            tabID: statement.text(at: 2),
+            recordedAt: statement.date(at: 3),
+            noteText: statement.text(at: 4),
+            createdAt: statement.date(at: 5),
+            updatedAt: statement.date(at: 6)
+        )
     }
 
     func fetchAttachments(projectID: String) throws -> [AttachmentItem] {
@@ -410,7 +453,7 @@ final class SQLiteDatabase {
             SELECT id, project_id, file_name, relative_path, kind, file_size, created_at, updated_at
             FROM attachments
             WHERE project_id = ?
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, rowid DESC
             """,
             bindings: [.text(projectID)]
         ) { statement in
@@ -457,34 +500,62 @@ final class SQLiteDatabase {
         try execute("DELETE FROM attachments WHERE id = ?", bindings: [.text(id)])
     }
 
-    func insertLogEntry(projectID: String, tabID: String, recordedAt: Date, noteText: String) throws {
+    @discardableResult
+    func insertLogEntry(projectID: String, tabID: String, recordedAt: Date, noteText: String) throws -> LogEntry? {
         let trimmed = noteText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return nil }
 
-        let id = UUID().uuidString
-        let now = TimeFormats.iso8601String(from: Date())
-        try execute(
-            """
-            INSERT INTO log_entries (id, project_id, tab_id, recorded_at, note_text, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            bindings: [
-                .text(id),
-                .text(projectID),
-                .text(tabID),
-                .text(TimeFormats.iso8601String(from: recordedAt)),
-                .text(trimmed),
-                .text(now),
-                .text(now),
-            ]
+        let now = Date()
+        let entry = LogEntry(
+            id: UUID().uuidString,
+            projectID: projectID,
+            tabID: tabID,
+            recordedAt: recordedAt,
+            noteText: trimmed,
+            createdAt: now,
+            updatedAt: now
         )
-        try execute(
-            """
-            INSERT INTO log_entries_fts (entry_id, project_id, tab_id, note_text)
-            VALUES (?, ?, ?, ?)
-            """,
-            bindings: [.text(id), .text(projectID), .text(tabID), .text(trimmed)]
-        )
+        try insertLogEntryRow(entry)
+        return entry
+    }
+
+    /// 按原始 ID 与时间重新写入一条场记（用于撤销删除）。
+    func restoreLogEntry(_ entry: LogEntry) throws {
+        try insertLogEntryRow(entry)
+    }
+
+    func deleteLogEntry(id: String) throws {
+        try performTransaction {
+            try execute("DELETE FROM log_entries_fts WHERE entry_id = ?", bindings: [.text(id)])
+            try execute("DELETE FROM log_entries WHERE id = ?", bindings: [.text(id)])
+        }
+    }
+
+    private func insertLogEntryRow(_ entry: LogEntry) throws {
+        try performTransaction {
+            try execute(
+                """
+                INSERT INTO log_entries (id, project_id, tab_id, recorded_at, note_text, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                bindings: [
+                    .text(entry.id),
+                    .text(entry.projectID),
+                    .text(entry.tabID),
+                    .text(TimeFormats.iso8601String(from: entry.recordedAt)),
+                    .text(entry.noteText),
+                    .text(TimeFormats.iso8601String(from: entry.createdAt)),
+                    .text(TimeFormats.iso8601String(from: entry.updatedAt)),
+                ]
+            )
+            try execute(
+                """
+                INSERT INTO log_entries_fts (entry_id, project_id, tab_id, note_text)
+                VALUES (?, ?, ?, ?)
+                """,
+                bindings: [.text(entry.id), .text(entry.projectID), .text(entry.tabID), .text(entry.noteText)]
+            )
+        }
     }
 
     func updateLogEntry(id: String, recordedAt: Date, noteText: String) throws {
@@ -494,64 +565,59 @@ final class SQLiteDatabase {
         }
 
         let now = TimeFormats.iso8601String(from: Date())
-        try execute(
-            """
-            UPDATE log_entries
-            SET recorded_at = ?, note_text = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            bindings: [
-                .text(TimeFormats.iso8601String(from: recordedAt)),
-                .text(trimmed),
-                .text(now),
-                .text(id),
-            ]
-        )
-        try execute("DELETE FROM log_entries_fts WHERE entry_id = ?", bindings: [.text(id)])
-        let rows = try query(
-            """
-            SELECT project_id, tab_id, note_text
-            FROM log_entries
-            WHERE id = ?
-            LIMIT 1
-            """,
-            bindings: [.text(id)]
-        ) { statement in
-            (
-                projectID: statement.text(at: 0),
-                tabID: statement.text(at: 1),
-                noteText: statement.text(at: 2)
-            )
-        }
-        if let row = rows.first {
+        try performTransaction {
             try execute(
                 """
-                INSERT INTO log_entries_fts (entry_id, project_id, tab_id, note_text)
-                VALUES (?, ?, ?, ?)
+                UPDATE log_entries
+                SET recorded_at = ?, note_text = ?, updated_at = ?
+                WHERE id = ?
                 """,
-                bindings: [.text(id), .text(row.projectID), .text(row.tabID), .text(row.noteText)]
+                bindings: [
+                    .text(TimeFormats.iso8601String(from: recordedAt)),
+                    .text(trimmed),
+                    .text(now),
+                    .text(id),
+                ]
             )
+            try execute("DELETE FROM log_entries_fts WHERE entry_id = ?", bindings: [.text(id)])
+            if let entry = try fetchEntry(id: id) {
+                try execute(
+                    """
+                    INSERT INTO log_entries_fts (entry_id, project_id, tab_id, note_text)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    bindings: [.text(entry.id), .text(entry.projectID), .text(entry.tabID), .text(entry.noteText)]
+                )
+            }
         }
     }
 
+    /// 全局搜索。
+    ///
+    /// 统一使用 LIKE 子串匹配：SQLite FTS5 的 unicode61 分词器会把连续的汉字视为一个整词，
+    /// 导致搜索"演员"匹配不到"演员忘词"。场记数据量通常在万条以内，LIKE 足够快且对中文可靠。
+    /// 多个关键词（空格分隔，支持双引号短语）之间为"且"关系。
     func search(query rawQuery: String) throws -> [SearchResult] {
         let normalizedQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard normalizedQuery.isEmpty == false else { return [] }
+        let terms = searchTerms(from: normalizedQuery)
+        guard terms.isEmpty == false else { return [] }
+        let patterns = terms.map { SQLiteValue.text(likePattern(for: $0)) }
 
-        let pattern = likePattern(for: normalizedQuery)
-        let fullTextPattern = ftsPattern(for: normalizedQuery)
-        guard fullTextPattern.isEmpty == false || normalizedQuery.isEmpty == false else { return [] }
+        func likeClause(_ column: String) -> String {
+            Array(repeating: "\(column) LIKE ? ESCAPE '\\'", count: terms.count).joined(separator: " AND ")
+        }
+
         var results: [SearchResult] = []
 
         let projectResults = try query(
             """
             SELECT id, title, updated_at, is_archived
             FROM projects
-            WHERE title LIKE ? ESCAPE '\\'
+            WHERE \(likeClause("title"))
             ORDER BY updated_at DESC
             LIMIT 30
             """,
-            bindings: [.text(pattern)]
+            bindings: patterns
         ) { statement in
             let isArchived = statement.int(at: 3) == 1
             return SearchResult(
@@ -563,7 +629,7 @@ final class SQLiteDatabase {
                 attachmentID: nil,
                 primaryText: statement.text(at: 1),
                 secondaryText: isArchived ? "项目标题 · 已归档" : "项目标题",
-                snippet: makeSnippet(from: statement.text(at: 1), query: normalizedQuery),
+                snippet: "",
                 updatedAt: statement.date(at: 2)
             )
         }
@@ -574,11 +640,11 @@ final class SQLiteDatabase {
             SELECT t.id, t.project_id, t.title, p.title, t.updated_at, p.is_archived
             FROM tabs t
             JOIN projects p ON p.id = t.project_id
-            WHERE t.title LIKE ? ESCAPE '\\'
+            WHERE \(likeClause("t.title"))
             ORDER BY t.updated_at DESC
             LIMIT 30
             """,
-            bindings: [.text(pattern)]
+            bindings: patterns
         ) { statement in
             let projectDescriptor = statement.int(at: 5) == 1
                 ? "\(statement.text(at: 3)) · 标签标题 · 已归档"
@@ -592,80 +658,70 @@ final class SQLiteDatabase {
                 attachmentID: nil,
                 primaryText: statement.text(at: 2),
                 secondaryText: projectDescriptor,
-                snippet: makeSnippet(from: statement.text(at: 2), query: normalizedQuery),
+                snippet: "",
                 updatedAt: statement.date(at: 4)
             )
         }
         results.append(contentsOf: tabTitleResults)
 
-        let tabBodyResults: [SearchResult] = if fullTextPattern.isEmpty {
-            []
-        } else {
-            try query(
-                """
-                SELECT t.id, t.project_id, t.title, t.body, p.title, t.updated_at, p.is_archived
-                FROM text_tabs_fts f
-                JOIN tabs t ON t.id = f.tab_id
-                JOIN projects p ON p.id = t.project_id
-                WHERE f.body MATCH ?
-                ORDER BY t.updated_at DESC
-                LIMIT 40
-                """,
-                bindings: [.text(fullTextPattern)]
-            ) { statement in
-                let projectDescriptor = statement.int(at: 6) == 1
-                    ? "\(statement.text(at: 4)) · 文本标签 · 已归档"
-                    : "\(statement.text(at: 4)) · 文本标签"
-                return SearchResult(
-                    id: "tab-body-\(statement.text(at: 0))",
-                    kind: .tabBody,
-                    projectID: statement.text(at: 1),
-                    tabID: statement.text(at: 0),
-                    entryID: nil,
-                    attachmentID: nil,
-                    primaryText: statement.text(at: 2),
-                    secondaryText: projectDescriptor,
-                    snippet: makeSnippet(from: statement.text(at: 3), query: normalizedQuery),
-                    updatedAt: statement.date(at: 5)
-                )
-            }
+        let tabBodyResults = try query(
+            """
+            SELECT t.id, t.project_id, t.title, t.body, p.title, t.updated_at, p.is_archived
+            FROM tabs t
+            JOIN projects p ON p.id = t.project_id
+            WHERE t.kind = 'text' AND \(likeClause("t.body"))
+            ORDER BY t.updated_at DESC
+            LIMIT 40
+            """,
+            bindings: patterns
+        ) { statement in
+            let projectDescriptor = statement.int(at: 6) == 1
+                ? "\(statement.text(at: 4)) · 文本标签 · 已归档"
+                : "\(statement.text(at: 4)) · 文本标签"
+            return SearchResult(
+                id: "tab-body-\(statement.text(at: 0))",
+                kind: .tabBody,
+                projectID: statement.text(at: 1),
+                tabID: statement.text(at: 0),
+                entryID: nil,
+                attachmentID: nil,
+                primaryText: statement.text(at: 2),
+                secondaryText: projectDescriptor,
+                snippet: makeSnippet(from: statement.text(at: 3), terms: terms),
+                updatedAt: statement.date(at: 5)
+            )
         }
         results.append(contentsOf: tabBodyResults)
 
-        let logResults: [SearchResult] = if fullTextPattern.isEmpty {
-            []
-        } else {
-            try query(
-                """
-                SELECT e.id, e.project_id, e.tab_id, e.note_text, p.title, t.title, e.updated_at, e.recorded_at, p.is_archived
-                FROM log_entries_fts f
-                JOIN log_entries e ON e.id = f.entry_id
-                JOIN projects p ON p.id = e.project_id
-                JOIN tabs t ON t.id = e.tab_id
-                WHERE f.note_text MATCH ?
-                ORDER BY e.updated_at DESC
-                LIMIT 80
-                """,
-                bindings: [.text(fullTextPattern)]
-            ) { statement in
-                let note = statement.text(at: 3)
-                let recordedAt = statement.date(at: 7)
-                let projectDescriptor = statement.int(at: 8) == 1
-                    ? "\(statement.text(at: 4)) · \(statement.text(at: 5)) · 已归档"
-                    : "\(statement.text(at: 4)) · \(statement.text(at: 5))"
-                return SearchResult(
-                    id: "entry-\(statement.text(at: 0))",
-                    kind: .logEntry,
-                    projectID: statement.text(at: 1),
-                    tabID: statement.text(at: 2),
-                    entryID: statement.text(at: 0),
-                    attachmentID: nil,
-                    primaryText: "\(TimeFormats.clockString(from: recordedAt)) \(note)",
-                    secondaryText: projectDescriptor,
-                    snippet: makeSnippet(from: note, query: normalizedQuery),
-                    updatedAt: statement.date(at: 6)
-                )
-            }
+        let logResults = try query(
+            """
+            SELECT e.id, e.project_id, e.tab_id, e.note_text, p.title, t.title, e.updated_at, e.recorded_at, p.is_archived
+            FROM log_entries e
+            JOIN projects p ON p.id = e.project_id
+            JOIN tabs t ON t.id = e.tab_id
+            WHERE \(likeClause("e.note_text"))
+            ORDER BY e.recorded_at DESC
+            LIMIT 120
+            """,
+            bindings: patterns
+        ) { statement in
+            let note = statement.text(at: 3)
+            let recordedAt = statement.date(at: 7)
+            let projectDescriptor = statement.int(at: 8) == 1
+                ? "\(statement.text(at: 4)) · \(TimeFormats.shortDateString(from: recordedAt)) · 已归档"
+                : "\(statement.text(at: 4)) · \(TimeFormats.shortDateString(from: recordedAt))"
+            return SearchResult(
+                id: "entry-\(statement.text(at: 0))",
+                kind: .logEntry,
+                projectID: statement.text(at: 1),
+                tabID: statement.text(at: 2),
+                entryID: statement.text(at: 0),
+                attachmentID: nil,
+                primaryText: "\(TimeFormats.clockString(from: recordedAt))  \(note)",
+                secondaryText: projectDescriptor,
+                snippet: "",
+                updatedAt: recordedAt
+            )
         }
         results.append(contentsOf: logResults)
 
@@ -674,11 +730,11 @@ final class SQLiteDatabase {
             SELECT a.id, a.project_id, a.file_name, p.title, a.updated_at, p.is_archived, a.kind
             FROM attachments a
             JOIN projects p ON p.id = a.project_id
-            WHERE a.file_name LIKE ? ESCAPE '\\'
+            WHERE \(likeClause("a.file_name"))
             ORDER BY a.updated_at DESC
             LIMIT 40
             """,
-            bindings: [.text(pattern)]
+            bindings: patterns
         ) { statement in
             let projectDescriptor = statement.int(at: 5) == 1
                 ? "\(statement.text(at: 3)) · \(attachmentKindLabel(rawValue: statement.text(at: 6))) · 已归档"
@@ -692,20 +748,26 @@ final class SQLiteDatabase {
                 attachmentID: statement.text(at: 0),
                 primaryText: statement.text(at: 2),
                 secondaryText: projectDescriptor,
-                snippet: makeSnippet(from: statement.text(at: 2), query: normalizedQuery),
+                snippet: "",
                 updatedAt: statement.date(at: 4)
             )
         }
         results.append(contentsOf: attachmentResults)
 
+        // 项目、标签等"导航型"结果排在前面，场记与文本内容按时间倒序
         return results
             .sorted { lhs, rhs in
+                let lhsRank = lhs.kind.sortRank
+                let rhsRank = rhs.kind.sortRank
+                if lhsRank != rhsRank {
+                    return lhsRank < rhsRank
+                }
                 if lhs.updatedAt != rhs.updatedAt {
                     return lhs.updatedAt > rhs.updatedAt
                 }
                 return lhs.primaryText < rhs.primaryText
             }
-            .prefix(120)
+            .prefix(200)
             .map { $0 }
     }
 
@@ -942,7 +1004,23 @@ final class SQLiteDatabase {
         }
     }
 
+    /// 执行事务。若当前已处于事务中，则使用 SAVEPOINT 嵌套，避免 "cannot start a transaction within a transaction"。
     func performTransaction<T>(_ operation: () throws -> T) throws -> T {
+        if sqlite3_get_autocommit(db) == 0 {
+            savepointCounter += 1
+            let name = "timenote_sp_\(savepointCounter)"
+            try execute("SAVEPOINT \(name);")
+            do {
+                let value = try operation()
+                try execute("RELEASE SAVEPOINT \(name);")
+                return value
+            } catch {
+                try? execute("ROLLBACK TO SAVEPOINT \(name);")
+                try? execute("RELEASE SAVEPOINT \(name);")
+                throw error
+            }
+        }
+
         try execute("BEGIN IMMEDIATE TRANSACTION;")
         do {
             let value = try operation()
@@ -1028,54 +1106,42 @@ final class SQLiteDatabase {
         return "%\(escaped)%"
     }
 
-    private func ftsPattern(for query: String) -> String {
-        let components = searchTerms(from: query)
-        return components
-            .map { term in
-                let escaped = sanitizeFTSSearchTerm(term)
-                guard escaped.isEmpty == false else { return nil }
-                return "\"\(escaped)\""
-            }
-            .compactMap { $0 }
-            .joined(separator: " AND ")
-    }
-
-    private func makeSnippet(from text: String, query: String, maxLength: Int = 80) -> String {
+    private func makeSnippet(from text: String, terms: [String], maxLength: Int = 80) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else { return "" }
 
-        let searchCandidates = searchTerms(from: query).sorted { lhs, rhs in
-            lhs.count > rhs.count
-        }
-        let matchedRange = searchCandidates.compactMap { candidate in
-            trimmed.range(of: candidate, options: [.caseInsensitive, .diacriticInsensitive])
-        }.first ?? trimmed.range(of: query, options: [.caseInsensitive, .diacriticInsensitive])
+        let matchedRange = terms
+            .sorted { $0.count > $1.count }
+            .lazy
+            .compactMap { trimmed.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) }
+            .first
 
         guard let range = matchedRange else {
             if trimmed.count <= maxLength { return trimmed }
-            let prefix = String(trimmed.prefix(maxLength))
-            return prefix + "..."
+            return String(trimmed.prefix(maxLength)) + "…"
         }
 
         let matchOffset = trimmed.distance(from: trimmed.startIndex, to: range.lowerBound)
-        let lowerOffset = max(0, matchOffset - (maxLength / 2))
+        let lowerOffset = max(0, matchOffset - (maxLength / 3))
         let lowerBound = trimmed.index(trimmed.startIndex, offsetBy: lowerOffset)
         let upperBound = trimmed.index(
             lowerBound,
             offsetBy: min(maxLength, trimmed.distance(from: lowerBound, to: trimmed.endIndex))
         )
         var snippet = String(trimmed[lowerBound..<upperBound])
+            .replacingOccurrences(of: "\n", with: " ")
 
         if lowerBound > trimmed.startIndex {
-            snippet = "..." + snippet
+            snippet = "…" + snippet
         }
         if upperBound < trimmed.endIndex {
-            snippet += "..."
+            snippet += "…"
         }
         return snippet
     }
 
-    private func searchTerms(from query: String) -> [String] {
+    /// 把搜索框内容拆成关键词：空白分隔，双引号包裹的部分作为整体短语。
+    func searchTerms(from query: String) -> [String] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else { return [] }
 
@@ -1085,8 +1151,7 @@ final class SQLiteDatabase {
         }
 
         let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
-        let matches = regex.matches(in: trimmed, range: range)
-        let terms = matches.compactMap { match -> String? in
+        let terms = regex.matches(in: trimmed, range: range).compactMap { match -> String? in
             for captureIndex in 1..<match.numberOfRanges {
                 let captureRange = match.range(at: captureIndex)
                 guard captureRange.location != NSNotFound,
@@ -1094,57 +1159,18 @@ final class SQLiteDatabase {
                 else {
                     continue
                 }
-                let term = sanitizeFTSSearchTerm(String(trimmed[stringRange]))
-                if term.isEmpty == false, isFTSOperator(term) == false {
+                let term = String(trimmed[stringRange])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"").union(.whitespaces))
+                if term.isEmpty == false {
                     return term
                 }
             }
             return nil
         }
 
-        if terms.isEmpty {
-            return [trimmed]
-        }
-
-        if trimmed.contains(where: \.isWhitespace) == false, terms.count == 1 {
-            return [trimmed]
-        }
-
-        return terms
-    }
-
-    private func sanitizeFTSSearchTerm(_ raw: String) -> String {
-        let scalars = raw.unicodeScalars.filter { scalar in
-            CharacterSet.alphanumerics.contains(scalar)
-                || CharacterSet.whitespaces.contains(scalar)
-                || isCJKScalar(scalar)
-        }
-        return String(String.UnicodeScalarView(scalars))
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func isFTSOperator(_ term: String) -> Bool {
-        switch term.uppercased() {
-        case "AND", "OR", "NOT":
-            return true
-        default:
-            return false
-        }
-    }
-
-    private func isCJKScalar(_ scalar: UnicodeScalar) -> Bool {
-        switch scalar.value {
-        case 0x3400...0x4DBF,
-             0x4E00...0x9FFF,
-             0xF900...0xFAFF,
-             0x3040...0x309F,
-             0x30A0...0x30FF,
-             0xAC00...0xD7AF:
-            return true
-        default:
-            return false
-        }
+        var seen = Set<String>()
+        let unique = terms.filter { seen.insert($0.lowercased()).inserted }
+        return Array(unique.prefix(8))
     }
 
     private func attachmentKindLabel(rawValue: String) -> String {
