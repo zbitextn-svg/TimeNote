@@ -57,11 +57,15 @@ DEBUG 构建中再加上 `TIMENOTE_DEMO_SEED=1`，会在空数据库里写入一
 
 ## 打包应用
 
+当前版本：**V1.1.23**（`Sources/TimeNoteApp/AppInfo.swift`，侧边栏左下角也会显示）。
+
 ```sh
-BUNDLE_NAME=TimeNoteV21 zsh scripts/package_app.sh
+zsh scripts/package_app.sh
 ```
 
-输出位于 `dist/TimeNoteV21.app` 和 `dist/TimeNoteV21.zip`。脚本默认名称仍为 `TimeNoteV20`，因此打包 V21 时请显式传入上述名称。当前构建使用本地 ad-hoc 签名，未经过 Apple 公证。
+输出位于 `dist/TimeNoteV1.1.23.app` 和 `dist/TimeNoteV1.1.23.zip`。可用 `APP_VERSION`、`BUNDLE_NAME` 环境变量覆盖；修改版本时请同时更新 `AppInfo.swift`。当前构建使用本地 ad-hoc 签名，未经过 Apple 公证。
+
+只安装了命令行工具（没有 Xcode）时，较新的 SDK 中 SwiftUI 依赖宏插件，可能需要指定较旧的 SDK，例如 `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk zsh scripts/package_app.sh`。
 
 ## 项目结构
 

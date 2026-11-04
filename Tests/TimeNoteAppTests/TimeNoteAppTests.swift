@@ -551,3 +551,62 @@ func updateEntrySavesEvenAfterSwitchingProject() throws {
     store.selectProject(id: projectA)
     #expect(store.entries.first?.noteText == "修改后的内容")
 }
+
+// MARK: - V1.1.23 回归测试
+
+/// Bug2：自动保存完成后，切到主场记再切回来，编辑器显示的必须是已保存的内容（以前会变成空白）
+@MainActor
+@Test
+func textTabShowsAutosavedBodyAfterSwitchingTabs() async throws {
+    let store = try makeIsolatedStore()
+    store.createProject()
+    let mainTabID = try #require(store.tabs.first(where: { $0.kind == .mainLog })?.id)
+    let textTabID = try #require(store.addTextTab())
+
+    store.updateCurrentTextTabBody("对本会：第 3 场改词")
+    #expect(store.currentTextTabIsSaving)
+
+    // 等自动保存（350ms 防抖）完成
+    try await Task.sleep(for: .milliseconds(900))
+    #expect(store.currentTextTabIsSaving == false)
+    #expect(store.currentTextTabLastSavedAt != nil)
+
+    // 不刷新项目，直接切走再切回来
+    store.selectTab(id: mainTabID)
+    store.selectTab(id: textTabID)
+    #expect(store.currentTextTabBody == "对本会：第 3 场改词")
+    #expect(store.selectedTab?.body == "对本会：第 3 场改词")
+
+    // 重新选中同一个标签（双击重命名时会这样做）也不能清空内容
+    store.selectTab(id: textTabID)
+    #expect(store.currentTextTabBody == "对本会：第 3 场改词")
+}
+
+/// Bug1：结束重命名时不能把选中状态强行改回被重命名的标签
+@MainActor
+@Test
+func renamingTabDoesNotStealSelection() throws {
+    let store = try makeIsolatedStore()
+    store.createProject()
+    let mainTabID = try #require(store.tabs.first(where: { $0.kind == .mainLog })?.id)
+    let textTabID = try #require(store.addTextTab())
+
+    // 用户点了主场记，随后输入框失焦触发重命名提交
+    store.selectTab(id: mainTabID)
+    store.renameTab(tabID: textTabID, title: "对本会")
+
+    #expect(store.selectedTabID == mainTabID)
+    #expect(store.tabs.first(where: { $0.id == textTabID })?.title == "对本会")
+}
+
+@Test
+func packageScriptVersionMatchesAppVersion() throws {
+    let scriptURL = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("scripts/package_app.sh")
+    let script = try String(contentsOf: scriptURL, encoding: .utf8)
+    #expect(AppInfo.version == "1.1.23")
+    #expect(script.contains("APP_VERSION=\"${APP_VERSION:-\(AppInfo.version)}\""))
+}

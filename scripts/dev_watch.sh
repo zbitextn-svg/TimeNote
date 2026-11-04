@@ -102,7 +102,7 @@ package_dev_app() {
   <key>CFBundleName</key><string>TimeNote Dev</string>
   <key>CFBundleDisplayName</key><string>TimeNote Dev</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.0.0-dev</string>
+  <key>CFBundleShortVersionString</key><string>1.1.23-dev</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>

@@ -3,8 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="TimeNoteApp"
-# 支持环境变量覆盖，例如: BUNDLE_NAME=TimeNoteV21 bash scripts/package_app.sh
-BUNDLE_NAME="${BUNDLE_NAME:-TimeNoteV20}"
+# 版本号与 Sources/TimeNoteApp/AppInfo.swift 保持一致
+APP_VERSION="${APP_VERSION:-1.1.23}"
+# 支持环境变量覆盖，例如: BUNDLE_NAME=TimeNoteV1.1.23 zsh scripts/package_app.sh
+BUNDLE_NAME="${BUNDLE_NAME:-TimeNoteV${APP_VERSION}}"
 BUILD_DIR="$ROOT_DIR/.build/arm64-apple-macosx/release"
 EXECUTABLE="$BUILD_DIR/$APP_NAME"
 DIST_DIR="$ROOT_DIR/dist"
@@ -52,7 +54,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <key>CFBundleName</key>
   <string>${BUNDLE_NAME}</string>
   <key>CFBundleGetInfoString</key>
-  <string>${BUNDLE_NAME} 0.1.0, Copyright 2026 frey</string>
+  <string>${BUNDLE_NAME} ${APP_VERSION}, Copyright 2026 frey</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundlePackageType</key>
@@ -60,9 +62,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.productivity</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>${APP_VERSION}</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>${APP_VERSION}</string>
   <key>NSHumanReadableCopyright</key>
   <string>Copyright 2026 frey</string>
   <key>LSMinimumSystemVersion</key>
@@ -85,3 +87,4 @@ ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
 echo "Packaged app: $APP_DIR"
 echo "Packaged zip: $ZIP_PATH"
 echo "Bundle display name: $BUNDLE_NAME"
+echo "Version: $APP_VERSION"

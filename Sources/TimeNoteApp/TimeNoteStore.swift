@@ -59,7 +59,8 @@ final class TimeNoteStore: ObservableObject {
     private var textAutosaveTasks: [String: Task<Void, Never>] = [:]
     private var textDraftBodies: [String: String] = [:]
     private var textDraftRevisions: [String: Int] = [:]
-    private var textTabSavedAt: [String: Date] = [:]
+    /// 发布出去，保存完成时界面能从"正在保存"刷新为"已保存"
+    @Published private var textTabSavedAt: [String: Date] = [:]
     private var inputHistory: [String] = []
     private var inputHistoryIndex: Int?
     private var searchTask: Task<Void, Never>?
@@ -275,8 +276,9 @@ final class TimeNoteStore: ObservableObject {
     func renameTab(tabID: String, title: String) {
         performDatabaseUpdate {
             try database.renameTab(tabID: tabID, title: title)
+            // 不改变当前选中的标签：用户可能是点了别的标签才结束重命名的，
+            // 这里如果强行选回被重命名的标签，就会出现"点主场记回不去"的问题。
             refreshCurrentProject()
-            selectedTabID = tabID
         }
     }
 
@@ -647,7 +649,7 @@ final class TimeNoteStore: ObservableObject {
         for (tabID, body) in textDraftBodies {
             do {
                 try database.updateTabBody(tabID: tabID, body: body)
-                textTabSavedAt[tabID] = .now
+                markTextTabSaved(tabID: tabID, body: body)
             } catch {
                 transientError = error.localizedDescription
             }
@@ -666,12 +668,23 @@ final class TimeNoteStore: ObservableObject {
         textAutosaveTasks[tabID] = nil
         do {
             try database.updateTabBody(tabID: tabID, body: body)
-            textTabSavedAt[tabID] = .now
+            markTextTabSaved(tabID: tabID, body: body)
         } catch {
             transientError = error.localizedDescription
         }
         textDraftBodies.removeValue(forKey: tabID)
         textDraftRevisions.removeValue(forKey: tabID)
+    }
+
+    /// 保存成功后同步内存中的标签内容。
+    ///
+    /// 之前只清掉草稿、没有更新 `tabs` 里的 body，之后重新选中这个标签时会读到创建时的旧内容
+    /// （通常是空的），编辑器显示为空；此时再输入就会用残缺内容覆盖已保存的文本。
+    private func markTextTabSaved(tabID: String, body: String) {
+        if let index = tabs.firstIndex(where: { $0.id == tabID }), tabs[index].body != body {
+            tabs[index].body = body
+        }
+        textTabSavedAt[tabID] = .now
     }
 
     /// 统一 flush 入口：flush 所有待保存草稿，并通知视图层 flush 各自的本地草稿
@@ -943,7 +956,7 @@ final class TimeNoteStore: ObservableObject {
                 let currentRevision = textDraftRevisions[tabID] ?? revision
                 if currentRevision == revision {
                     textDraftBodies.removeValue(forKey: tabID)
-                    textTabSavedAt[tabID] = .now
+                    markTextTabSaved(tabID: tabID, body: body)
                     return
                 }
 

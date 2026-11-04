@@ -15,6 +15,10 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var projectTitleSaveTask: Task<Void, Never>?
     @State private var isDropTargeted = false
+    /// 递增时让文本标签编辑器获得焦点（重命名回车确认后使用）
+    @State private var editorFocusRequest = 0
+    /// 重命名输入框是否真正获得过焦点（用于区分"点了别处"和"焦点还没落到输入框上"）
+    @State private var renameFieldDidGainFocus = false
 
     var body: some View {
         layoutWithDialogs
@@ -28,6 +32,12 @@ struct ContentView: View {
                 alignSidebarToSelection()
                 projectTitleDraft = store.selectedProject?.title ?? ""
                 renamingTabID = nil
+            }
+            .onChange(of: store.selectedTabID) { _, newTabID in
+                // 正在重命名时切到了别的标签（点击、⌘数字、搜索跳转等）：先提交重命名
+                if let renaming = renamingTabID, renaming != newTabID {
+                    finishRenaming(tabID: renaming)
+                }
             }
             .onChange(of: scenePhase) { _, newPhase in
                 // 窗口失活/进入后台时，立即 flush 所有待保存草稿
@@ -184,19 +194,26 @@ struct ContentView: View {
 
             Divider()
 
-            Button {
-                store.createProject()
-            } label: {
-                Label("新建项目", systemImage: "plus")
-                    .font(.callout.weight(.medium))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
+            HStack(spacing: 8) {
+                Button {
+                    store.createProject()
+                } label: {
+                    Label("新建项目", systemImage: "plus")
+                        .font(.callout.weight(.medium))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Theme.textSecondary)
+                .help("新建项目（⌘N）")
+
+                Text(AppInfo.displayVersion)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(Theme.textTertiary)
+                    .help("TimeNote 版本")
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(Theme.textSecondary)
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
-            .help("新建项目（⌘N）")
         }
         .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
     }
@@ -408,15 +425,24 @@ struct ContentView: View {
                             .focused($renamingTabFocused)
                             .onSubmit {
                                 finishRenaming(tabID: tab.id)
+                                // 回车确认后把光标交给正文编辑器，方便直接开始写
+                                editorFocusRequest += 1
                             }
                             .onAppear {
-                                renamingTabFocused = true
+                                // 输入框创建出来之后再请求焦点；
+                                // 若在创建前就设置，焦点会落空并立刻被判定为"失焦"，重命名框一闪就关掉
+                                Task { @MainActor in
+                                    renamingTabFocused = true
+                                }
                             }
                             .onExitCommand {
                                 cancelRenaming()
                             }
                             .onChange(of: renamingTabFocused) { _, isFocused in
-                                if isFocused == false, renamingTabID == tab.id {
+                                if isFocused {
+                                    renameFieldDidGainFocus = true
+                                } else if renameFieldDidGainFocus, renamingTabID == tab.id {
+                                    // 只有真正拿到过焦点后再失焦，才算"点了别处、确认重命名"
                                     finishRenaming(tabID: tab.id)
                                 }
                             }
@@ -428,6 +454,12 @@ struct ContentView: View {
                             shortcutIndex: index < 9 ? index + 1 : nil
                         )
                         .onTapGesture {
+                            // 点了另一个标签：先提交正在进行的重命名（不必先按回车），再切换。
+                            // 注意排除被重命名的标签本身——双击开始重命名时，第二下单击也会走到这里，
+                            // 如果不排除，刚打开的重命名框会被立刻关掉。
+                            if let renaming = renamingTabID, renaming != tab.id {
+                                finishRenaming(tabID: renaming)
+                            }
                             store.clearSearch()
                             store.selectTab(id: tab.id)
                         }
@@ -498,7 +530,11 @@ struct ContentView: View {
                     store.deleteEntry(entry.id)
                 }
                 .frame(minWidth: 300, idealWidth: 440)
-                TextTabEditor(store: store)
+                TextTabEditor(
+                    store: store,
+                    allowsAutoFocus: renamingTabID == nil,
+                    focusRequest: editorFocusRequest
+                )
                     .frame(minWidth: 260)
             }
         }
@@ -589,6 +625,9 @@ struct ContentView: View {
 
     private func createTextTabAndRename() {
         guard store.selectedProject != nil else { return }
+        if let renaming = renamingTabID {
+            finishRenaming(tabID: renaming)
+        }
         store.clearSearch()
         if let tabID = store.addTextTab(),
            let tab = store.tabs.first(where: { $0.id == tabID }) {
@@ -597,10 +636,13 @@ struct ContentView: View {
     }
 
     private func startRenaming(_ tab: TabItem) {
+        if let renaming = renamingTabID, renaming != tab.id {
+            finishRenaming(tabID: renaming)
+        }
         store.selectTab(id: tab.id)
+        renameFieldDidGainFocus = false
         renamingTabID = tab.id
         renamingTabTitle = tab.title
-        renamingTabFocused = true
     }
 
     private func finishRenaming(tabID: String) {
@@ -613,12 +655,14 @@ struct ContentView: View {
         renamingTabID = nil
         renamingTabTitle = ""
         renamingTabFocused = false
+        renameFieldDidGainFocus = false
     }
 
     private func cancelRenaming() {
         renamingTabID = nil
         renamingTabTitle = ""
         renamingTabFocused = false
+        renameFieldDidGainFocus = false
     }
 
     private func handleAttachmentDrop(providers: [NSItemProvider]) -> Bool {
@@ -1421,6 +1465,10 @@ private struct EntryRowView: View {
 
 private struct TextTabEditor: View {
     @ObservedObject var store: TimeNoteStore
+    /// 正在重命名标签时为 false：编辑器不能抢走标题输入框的焦点，
+    /// 否则输入的标签名会跑进正文、重命名框也会被提前关闭。
+    let allowsAutoFocus: Bool
+    let focusRequest: Int
     @State private var draftBody = ""
     @FocusState private var editorFocused: Bool
 
@@ -1468,10 +1516,17 @@ private struct TextTabEditor: View {
         .background(Theme.surface)
         .onAppear {
             draftBody = store.currentTextTabBody
-            editorFocused = true
+            if allowsAutoFocus {
+                editorFocused = true
+            }
         }
         .onChange(of: store.selectedTabID) { _, _ in
             draftBody = store.currentTextTabBody
+            if allowsAutoFocus {
+                editorFocused = true
+            }
+        }
+        .onChange(of: focusRequest) { _, _ in
             editorFocused = true
         }
         .onChange(of: store.currentTextTabBody) { _, newValue in
