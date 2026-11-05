@@ -7,8 +7,6 @@ APP_NAME="TimeNoteApp"
 APP_VERSION="${APP_VERSION:-1.1.23}"
 # 支持环境变量覆盖，例如: BUNDLE_NAME=TimeNoteV1.1.23 zsh scripts/package_app.sh
 BUNDLE_NAME="${BUNDLE_NAME:-TimeNoteV${APP_VERSION}}"
-BUILD_DIR="$ROOT_DIR/.build/arm64-apple-macosx/release"
-EXECUTABLE="$BUILD_DIR/$APP_NAME"
 DIST_DIR="$ROOT_DIR/dist"
 APP_DIR="$DIST_DIR/$BUNDLE_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -27,6 +25,13 @@ for icon in icon_16x16 icon_16x16@2x icon_32x32 icon_32x32@2x icon_128x128 icon_
   fi
 done
 swift build -c release
+# 向 SwiftPM 询问实际的构建输出目录（不同 Swift 版本、架构、SDK 下目录名不同，不能写死）
+BUILD_DIR="$(swift build -c release --show-bin-path)"
+EXECUTABLE="$BUILD_DIR/$APP_NAME"
+if [[ ! -x "$EXECUTABLE" ]]; then
+  echo "找不到编译产物：$EXECUTABLE" >&2
+  exit 1
+fi
 
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"

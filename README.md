@@ -30,7 +30,6 @@
 
 - macOS 14 或更高版本
 - Swift 6.1 或更高版本（Xcode 16.3+ 或对应的 Command Line Tools）
-- 当前打包脚本按 Apple Silicon（arm64）目录取构建结果
 - 无第三方 Swift 包依赖，使用系统 SQLite 3
 
 在仓库根目录执行：

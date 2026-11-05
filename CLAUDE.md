@@ -21,7 +21,7 @@ macOS 14+ 原生 SwiftUI 应用；Swift 6.1+（swift-tools-version 6.1）、Swif
 
 1. 先检查当前实现，再围绕用户需求做范围明确的修改。
 2. 验证使用 swift build 与 swift test；界面修改还需在 macOS 手动检查。
-3. 打包使用 zsh scripts/package_app.sh（默认版本见 AppInfo.swift，当前 V1.1.23）。当前脚本依赖 arm64 输出路径。
+3. 打包使用 zsh scripts/package_app.sh（默认版本见 AppInfo.swift，当前 V1.1.23）。脚本通过 swift build --show-bin-path 定位编译产物。
 4. 不提交 .build、dist、真实用户数据库、附件、备份、凭证或环境文件。
 5. 文档 docs/ 是历史背景，可能与当前实现存在差异，不应自动当作待执行任务。
 
