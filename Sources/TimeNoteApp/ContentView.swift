@@ -58,12 +58,6 @@ struct ContentView: View {
             sidebar
         } detail: {
             detail
-                .inspector(isPresented: $store.isAttachmentPanelPresented) {
-                    AttachmentInspector(store: store) { attachment in
-                        pendingConfirmation = .deleteAttachment(id: attachment.id, name: attachment.fileName)
-                    }
-                    .inspectorColumnWidth(min: 240, ideal: 280, max: 420)
-                }
                 .toolbar { detailToolbar }
         }
         .navigationTitle(store.selectedProject?.title ?? "TimeNote")
@@ -303,21 +297,20 @@ struct ContentView: View {
             }
             .help(store.isWindowPinned ? "取消窗口置顶" : "让窗口始终显示在最前面")
 
+            // 附件以弹出面板显示，浮在内容之上，不挤占主场记和文本标签的宽度
             Button {
                 store.isAttachmentPanelPresented.toggle()
             } label: {
                 Label("附件", systemImage: store.attachments.isEmpty ? "paperclip" : "paperclip.badge.ellipsis")
             }
-            .help("显示或隐藏附件（⌥⌘A）")
+            .help(store.attachments.isEmpty ? "附件（⌥⌘A）" : "附件：\(store.attachments.count) 个（⌥⌘A）")
             .disabled(store.selectedProject == nil)
-
-            Button {
-                store.exportCurrentProject()
-            } label: {
-                Label("导出", systemImage: "square.and.arrow.up")
+            .popover(isPresented: $store.isAttachmentPanelPresented, arrowEdge: .bottom) {
+                AttachmentPanel(store: store) { attachment in
+                    pendingConfirmation = .deleteAttachment(id: attachment.id, name: attachment.fileName)
+                }
+                .frame(width: 340, height: attachmentPanelHeight)
             }
-            .help("把整个项目导出为 .txt（⌘E）")
-            .disabled(store.selectedProject == nil)
 
             Menu {
                 Button("复制当前标签全部内容") {
@@ -357,6 +350,25 @@ struct ContentView: View {
     }
 
     private var header: some View {
+        HStack(alignment: .center, spacing: 16) {
+            headerTitle
+            ExportButton {
+                store.exportCurrentProject()
+            }
+        }
+        .padding(.horizontal, Theme.Spacing.pageHorizontal)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
+    }
+
+    /// 附件面板高度随内容变化：空时只放提示区，有文件时按条数增高，最多 440
+    private var attachmentPanelHeight: CGFloat {
+        let count = store.attachments.count
+        guard count > 0 else { return 236 }
+        return min(96 + CGFloat(count) * 46, 440)
+    }
+
+    private var headerTitle: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 TextField("项目标题", text: $projectTitleDraft)
@@ -392,9 +404,6 @@ struct ContentView: View {
             .font(.caption)
             .foregroundStyle(Theme.textSecondary)
         }
-        .padding(.horizontal, Theme.Spacing.pageHorizontal)
-        .padding(.top, 14)
-        .padding(.bottom, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -1727,7 +1736,39 @@ private struct SearchResultRow: View {
 
 // MARK: - 附件面板
 
-private struct AttachmentInspector: View {
+/// 标题右侧的「导出」主按钮：琥珀色实心，是界面上最醒目的操作
+private struct ExportButton: View {
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 13, weight: .semibold))
+                    .offset(y: -1)
+                Text("导出")
+                    .font(.system(size: 14, weight: .semibold))
+            }
+            .foregroundStyle(Color.white)
+            .padding(.horizontal, 16)
+            .frame(height: 34)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Theme.exportFill)
+                    .brightness(isHovered ? 0.03 : 0)
+            )
+            .shadow(color: Theme.accent.opacity(0.28), radius: isHovered ? 6 : 3, y: 1)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .help("把整个项目导出为 .txt 文件（⌘E）")
+        .accessibilityLabel("导出项目")
+    }
+}
+
+private struct AttachmentPanel: View {
     @ObservedObject var store: TimeNoteStore
     let onRequestDelete: (AttachmentItem) -> Void
     @State private var isDropTargeted = false
@@ -1740,7 +1781,7 @@ private struct AttachmentInspector: View {
                 if store.attachments.isEmpty == false {
                     Text("\(store.attachments.count)")
                         .font(.caption.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(Theme.textSecondary)
+                        .foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button {
@@ -1783,7 +1824,7 @@ private struct AttachmentInspector: View {
 
                 Text("把文件拖到窗口任意位置即可导入")
                     .font(.caption2)
-                    .foregroundStyle(Theme.textTertiary)
+                    .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
             }
@@ -1809,10 +1850,10 @@ private struct AttachmentInspector: View {
         VStack(spacing: 10) {
             Image(systemName: "tray.and.arrow.down")
                 .font(.system(size: 24, weight: .light))
-                .foregroundStyle(isDropTargeted ? Theme.accent : Theme.textTertiary)
+                .foregroundStyle(isDropTargeted ? Theme.accent : Color.secondary)
             Text("拖入图片、音频或视频")
                 .font(.callout)
-                .foregroundStyle(Theme.textSecondary)
+                .foregroundStyle(.secondary)
             Button("选择文件…") {
                 store.importAttachments()
             }
@@ -1852,12 +1893,12 @@ private struct AttachmentRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(attachment.fileName)
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Theme.textPrimary)
+                    .foregroundStyle(.primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text("\(attachment.kind.label) · \(ByteCountFormatter.string(fromByteCount: attachment.fileSize, countStyle: .file))")
                     .font(.caption2)
-                    .foregroundStyle(Theme.textTertiary)
+                    .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
         }

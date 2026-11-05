@@ -165,6 +165,13 @@ while true; do
           test)
             swift test --manifest-cache none > "$DEV_DIR/test.log" 2>&1
             code=$?
+            # 增量编译偶尔丢失 Swift Testing 宏插件，清理后重试一次
+            if [[ $code -ne 0 ]] && grep -q "plugin for module 'TestingMacros' not found" "$DEV_DIR/test.log"; then
+              echo "  test：测试宏插件丢失，清理后重试"
+              rm -rf "$ROOT_DIR/.build"
+              swift test --manifest-cache none > "$DEV_DIR/test.log" 2>&1
+              code=$?
+            fi
             result="$result test=$code"
             echo "  test -> $code"
             ;;

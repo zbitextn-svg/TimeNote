@@ -20,6 +20,8 @@ enum Theme {
     // 强调色：琥珀
     static let accent = Color(light: Color(hex: "#C9711A"), dark: Color(hex: "#F0A24A"))
     static let accentSoft = Color(light: Color(hex: "#C9711A").opacity(0.12), dark: Color(hex: "#F0A24A").opacity(0.16))
+    /// 实心主按钮底色：比强调色略深，保证白字对比度（≥4.5:1）
+    static let exportFill = Color(light: Color(hex: "#A9560B"), dark: Color(hex: "#B05C0F"))
     static let success = Color(light: Color(hex: "#3B8A5A"), dark: Color(hex: "#6CC08C"))
     static let danger = Color(light: Color(hex: "#C2453A"), dark: Color(hex: "#F07A6E"))
 
