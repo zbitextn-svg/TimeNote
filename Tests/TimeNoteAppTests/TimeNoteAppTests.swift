@@ -1,4 +1,6 @@
 import Foundation
+import PDFKit
+import SQLite3
 import Testing
 @testable import TimeNoteApp
 
@@ -607,8 +609,10 @@ func packageScriptVersionMatchesAppVersion() throws {
         .deletingLastPathComponent()
         .appendingPathComponent("scripts/package_app.sh")
     let script = try String(contentsOf: scriptURL, encoding: .utf8)
-    #expect(AppInfo.version == "1.1.23")
     #expect(script.contains("APP_VERSION=\"${APP_VERSION:-\(AppInfo.version)}\""))
+    // 录音转写依赖 macOS 26，安装包的最低系统版本要一致
+    #expect(script.contains("<string>26.0</string>"))
+    #expect(script.contains("NSMicrophoneUsageDescription"))
 }
 
 // MARK: - 标签删除按钮
@@ -648,4 +652,261 @@ func deletingSelectedTextTabFallsBackToMainLog() throws {
     // 主场记不能被删除
     store.deleteTab(tabID: mainTabID)
     #expect(store.tabs.contains(where: { $0.id == mainTabID }))
+}
+
+// MARK: - 录音与转写（V1.2）
+
+@Test
+func olderDatabaseGainsRecordingTablesWithoutLosingData() throws {
+    let url = try makeTestDatabaseURL()
+    var projectID = ""
+    do {
+        let database = try SQLiteDatabase(path: url)
+        let project = try database.createProject(title: "老项目")
+        projectID = project.id
+        let mainTab = try #require(try database.fetchMainTab(projectID: project.id))
+        try database.insertLogEntry(projectID: project.id, tabID: mainTab.id, recordedAt: .now, noteText: "旧版本的场记")
+    }
+    // 模拟 V1.1.23 的数据库：没有录音相关的表
+    var handle: OpaquePointer?
+    #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+    #expect(sqlite3_exec(handle, "DROP TABLE transcript_segments; DROP TABLE recordings;", nil, nil, nil) == SQLITE_OK)
+    sqlite3_close(handle)
+
+    let upgraded = try SQLiteDatabase(path: url)
+    let mainTab = try #require(try upgraded.fetchMainTab(projectID: projectID))
+    #expect(try upgraded.fetchEntries(projectID: projectID, tabID: mainTab.id).map(\.noteText) == ["旧版本的场记"])
+    #expect(try upgraded.fetchRecordings(projectID: projectID).isEmpty)
+    let recording = try upgraded.insertRecording(projectID: projectID, title: "录音 1", relativePath: "a.caf", startedAt: .now, locale: "zh-CN")
+    #expect(try upgraded.fetchRecording(id: recording.id)?.status == .recording)
+}
+
+@Test
+func recordingLifecycleAndTranscriptSearch() throws {
+    let database = try makeTestDatabase()
+    let project = try database.createProject(title: "访谈录制")
+    let startedAt = Date(timeIntervalSince1970: 1_800_000_000)
+    let recording = try database.insertRecording(
+        projectID: project.id,
+        title: "录音 1",
+        relativePath: "attachments/\(project.id)/recordings/x.caf",
+        startedAt: startedAt,
+        locale: "zh-CN"
+    )
+    try database.insertTranscriptSegment(recordingID: recording.id, projectID: project.id, startMs: 65_000, endMs: 68_500, text: "嘉宾说到了第一次登台的经历")
+    try database.insertTranscriptSegment(recordingID: recording.id, projectID: project.id, startMs: 3_000, endMs: 4_000, text: "  ")
+    try database.insertTranscriptSegment(recordingID: recording.id, projectID: project.id, startMs: 1_000, endMs: 2_000, text: "开始")
+
+    // 空白句子不保存，结果按时间排序
+    #expect(try database.fetchTranscriptSegments(recordingID: recording.id).map(\.text) == ["开始", "嘉宾说到了第一次登台的经历"])
+    #expect(try database.fetchUnfinishedRecordings().map(\.id) == [recording.id])
+
+    try database.finishRecording(id: recording.id, relativePath: "attachments/\(project.id)/recordings/x.m4a", durationMs: 120_000, fileSize: 2048, status: .finished)
+    let finished = try #require(try database.fetchRecording(id: recording.id))
+    #expect(finished.status == .finished)
+    #expect(finished.duration == 120)
+    #expect(finished.relativePath.hasSuffix(".m4a"))
+    #expect(try database.fetchUnfinishedRecordings().isEmpty)
+
+    let results = try database.search(query: "登台")
+    let hit = try #require(results.first(where: { $0.kind == .transcript }))
+    #expect(hit.recordingID == recording.id)
+    #expect(hit.recordingOffsetMs == 65_000)
+    #expect(hit.projectID == project.id)
+
+    // 删除项目时录音与转写一并删除
+    try database.deleteProject(id: project.id)
+    #expect(try database.fetchRecording(id: recording.id) == nil)
+    #expect(try database.fetchTranscriptSegments(recordingID: recording.id).isEmpty)
+}
+
+@Test
+func recordingOffsetMapsLogEntriesIntoTheRecording() {
+    let start = Date(timeIntervalSince1970: 1_800_000_000)
+    var recording = Recording(
+        id: "r", projectID: "p", title: "录音 1", relativePath: "", startedAt: start,
+        durationMs: 600_000, fileSize: 0, locale: "zh-CN", status: .finished, createdAt: start, updatedAt: start
+    )
+    #expect(recording.offset(of: start.addingTimeInterval(192)) == 192)
+    #expect(recording.offset(of: start.addingTimeInterval(-1)) == nil)
+    #expect(recording.offset(of: start.addingTimeInterval(601)) == nil)
+    // 录制中：区间截止到当前时刻
+    recording.status = .recording
+    #expect(recording.offset(of: start.addingTimeInterval(900), now: start.addingTimeInterval(1000)) == 900)
+    #expect(DurationFormats.string(from: 192.7) == "03:12")
+    #expect(DurationFormats.string(from: 3725) == "1:02:05")
+}
+
+// MARK: - Excel / PDF 场记单
+
+private func makeSampleReport() -> ProjectReport {
+    let day1 = Date(timeIntervalSince1970: 1_800_000_000)
+    let day2 = day1.addingTimeInterval(86_400)
+    let entries = [
+        LogEntry(id: "1", projectID: "p", tabID: "t", recordedAt: day1, noteText: "第1场 第2镜 OK <好条> & 保", createdAt: day1, updatedAt: day1),
+        LogEntry(id: "2", projectID: "p", tabID: "t", recordedAt: day1.addingTimeInterval(130), noteText: "演员忘词，NG", createdAt: day1, updatedAt: day1),
+        LogEntry(id: "3", projectID: "p", tabID: "t", recordedAt: day2, noteText: "第二天开机\n换场景", createdAt: day2, updatedAt: day2),
+    ]
+    let recording = Recording(
+        id: "r", projectID: "p", title: "录音 1", relativePath: "", startedAt: day1.addingTimeInterval(-60),
+        durationMs: 600_000, fileSize: 0, locale: "zh-CN", status: .finished, createdAt: day1, updatedAt: day1
+    )
+    let segment = TranscriptSegment(id: "s", recordingID: "r", projectID: "p", startMs: 70_000, endMs: 72_000, text: "我们再来一条")
+    return ProjectReport(
+        projectTitle: "测试节目",
+        exportedAt: day2,
+        entries: entries,
+        textSections: [.init(title: "镜头表", body: "1. 全景\n2. 近景")],
+        recordings: [.init(recording: recording, segments: [segment])]
+    )
+}
+
+@Test
+func crc32MatchesReferenceValue() {
+    #expect(CRC32.checksum(Data("123456789".utf8)) == 0xCBF4_3926)
+}
+
+@Test
+func xlsxSheetNamesAndColumnsAreValid() {
+    #expect(XLSXReportWriter.columnName(0) == "A")
+    #expect(XLSXReportWriter.columnName(25) == "Z")
+    #expect(XLSXReportWriter.columnName(26) == "AA")
+    let names = XLSXReportWriter.uniqueSheetNames(["场记", "场记", "a/b:c", String(repeating: "长", count: 40)])
+    #expect(names[0] == "场记")
+    #expect(names[1] == "场记 (2)")
+    #expect(names[2] == "a b c")
+    #expect(names[3].count == 31)
+    #expect(XLSXReportWriter.escape("a<b>&\u{0007}\"") == "a&lt;b&gt;&amp;&quot;")
+}
+
+@Test
+func xlsxExportIsAValidWorkbook() throws {
+    let report = makeSampleReport()
+    let sheets = XLSXReportWriter.sheets(for: report)
+    #expect(sheets.map(\.name) == ["场记", "文本标签", "录音文字"])
+    // 场记表：表头 + 3 条，落在录音里的条目带录音位置
+    #expect(sheets[0].rows.count == 4)
+    #expect(sheets[0].rows[0] == ["日期", "时间", "内容", "录音位置"])
+    #expect(sheets[0].rows[1][3] == "录音 1 · 01:00")
+    #expect(sheets[0].rows[3][3] == "")
+
+    let directory = try makeTemporaryDirectory()
+    let url = directory.appendingPathComponent("场记单.xlsx")
+    try XLSXReportWriter.data(for: report).write(to: url)
+
+    // 用系统 unzip 校验压缩包结构与 CRC
+    #expect(try runProcess("/usr/bin/unzip", ["-tq", url.path]).status == 0)
+    let sheetXML = try runProcess("/usr/bin/unzip", ["-p", url.path, "xl/worksheets/sheet1.xml"]).output
+    #expect(sheetXML.contains("第1场 第2镜 OK &lt;好条&gt; &amp; 保"))
+    let workbookXML = try runProcess("/usr/bin/unzip", ["-p", url.path, "xl/workbook.xml"]).output
+    #expect(workbookXML.contains("录音文字"))
+}
+
+@MainActor
+@Test
+func pdfExportProducesReadablePages() throws {
+    var report = makeSampleReport()
+    let pdf = PDFReportWriter.data(for: report)
+    let document = try #require(PDFDocument(data: pdf))
+    #expect(document.pageCount >= 1)
+    let text = document.string ?? ""
+    #expect(text.contains("测试节目"))
+    #expect(text.contains("演员忘词"))
+    #expect(text.contains("镜头表"))
+    // 录音文字附在场记单后面
+    #expect(text.contains("录音文字"))
+    #expect(text.contains("我们再来一条"))
+
+    // 很多条场记时自动分页
+    let base = report.entries[0]
+    let many = (0..<400).map { index in
+        LogEntry(id: "m\(index)", projectID: "p", tabID: "t", recordedAt: base.recordedAt.addingTimeInterval(Double(index)), noteText: "第 \(index) 条记录", createdAt: base.createdAt, updatedAt: base.updatedAt)
+    }
+    report = ProjectReport(projectTitle: report.projectTitle, exportedAt: report.exportedAt, entries: many, textSections: [], recordings: [])
+    let longDocument = try #require(PDFDocument(data: PDFReportWriter.data(for: report)))
+    #expect(longDocument.pageCount > 5)
+    #expect(longDocument.page(at: longDocument.pageCount - 1)?.string?.contains("第 399 条记录") == true)
+}
+
+@MainActor
+@Test
+func storeBuildsReportWithEntriesTextTabsAndRecordings() throws {
+    let store = try makeIsolatedStore()
+    store.createProject()
+    store.entryInputText = "开机"
+    store.submitMainLogEntry()
+    _ = store.addTextTab()
+    store.updateCurrentTextTabBody("备注内容")
+    let project = try #require(store.selectedProject)
+
+    let report = try store.makeReport(for: project)
+    #expect(report.entries.map(\.noteText) == ["开机"])
+    #expect(report.textSections.map(\.body) == ["备注内容"])
+    #expect(report.recordings.isEmpty)
+}
+
+private func runProcess(_ path: String, _ arguments: [String]) throws -> (status: Int32, output: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: path)
+    process.arguments = arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = Pipe()
+    try process.run()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+}
+
+@MainActor
+@Test
+func packageExportContainsReportsTranscriptsAndAudio() throws {
+    let report = makeSampleReport()
+    let directory = try makeTemporaryDirectory()
+    let audioURL = directory.appendingPathComponent("source.m4a")
+    try Data("fake audio".utf8).write(to: audioURL)
+    let service = ExportService()
+    let names = ProjectPackageBuilder.baseNames(for: report.recordings.map(\.recording), sanitize: service.sanitizeFileName)
+    let baseName = try #require(names["r"])
+    #expect(baseName.hasPrefix("录音 1（"))
+    #expect(baseName.contains(":") == false)
+
+    let contents = ProjectPackageBuilder.Contents(
+        folderName: "测试节目 场记资料",
+        pdf: PDFReportWriter.data(for: report),
+        xlsx: XLSXReportWriter.data(for: report),
+        text: "场记",
+        transcripts: report.recordings.map { .init(fileName: baseName + ".txt", text: service.transcriptText(for: $0)) },
+        audio: [.init(source: audioURL, fileName: baseName + ".m4a")]
+    )
+    let zipURL = directory.appendingPathComponent("资料.zip")
+    try ProjectPackageBuilder.build(contents, at: zipURL)
+
+    // 用「归档实用工具」同款的 ditto 解压，检查中文文件名与内容
+    let extracted = directory.appendingPathComponent("解压", isDirectory: true)
+    #expect(try runProcess("/usr/bin/ditto", ["-x", "-k", zipURL.path, extracted.path]).status == 0)
+    let root = extracted.appendingPathComponent("测试节目 场记资料", isDirectory: true)
+    let fileManager = FileManager.default
+    #expect(fileManager.fileExists(atPath: root.appendingPathComponent("场记单.pdf").path))
+    #expect(fileManager.fileExists(atPath: root.appendingPathComponent("场记单.xlsx").path))
+    #expect(try Data(contentsOf: root.appendingPathComponent("录音/\(baseName).m4a")) == Data("fake audio".utf8))
+    let transcript = try String(contentsOf: root.appendingPathComponent("录音文字/\(baseName).txt"), encoding: .utf8)
+    #expect(transcript.contains("我们再来一条"))
+    // 压缩包结构与 CRC 正确
+    #expect(try runProcess("/usr/bin/unzip", ["-tq", zipURL.path]).status == 0)
+}
+
+@Test
+func emptyInterruptedRecordingsAreFoundForCleanup() throws {
+    let database = try makeTestDatabase()
+    let project = try database.createProject(title: "清理测试")
+    let empty = try database.insertRecording(projectID: project.id, title: "空", relativePath: "a.m4a", startedAt: .now, locale: "zh-CN")
+    try database.finishRecording(id: empty.id, relativePath: "a.m4a", durationMs: 0, fileSize: 0, status: .interrupted)
+    let withText = try database.insertRecording(projectID: project.id, title: "有字", relativePath: "b.m4a", startedAt: .now, locale: "zh-CN")
+    try database.finishRecording(id: withText.id, relativePath: "b.m4a", durationMs: 0, fileSize: 0, status: .interrupted)
+    try database.insertTranscriptSegment(recordingID: withText.id, projectID: project.id, startMs: 0, endMs: 100, text: "你好")
+    let normal = try database.insertRecording(projectID: project.id, title: "正常", relativePath: "c.m4a", startedAt: .now, locale: "zh-CN")
+    try database.finishRecording(id: normal.id, relativePath: "c.m4a", durationMs: 60_000, fileSize: 10, status: .finished)
+
+    #expect(try database.fetchEmptyInterruptedRecordings().map(\.id) == [empty.id])
 }

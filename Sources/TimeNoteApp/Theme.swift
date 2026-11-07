@@ -24,6 +24,10 @@ enum Theme {
     static let exportFill = Color(light: Color(hex: "#A9560B"), dark: Color(hex: "#B05C0F"))
     static let success = Color(light: Color(hex: "#3B8A5A"), dark: Color(hex: "#6CC08C"))
     static let danger = Color(light: Color(hex: "#C2453A"), dark: Color(hex: "#F07A6E"))
+    /// 录音：红色，与琥珀色区分
+    static let recording = Color(light: Color(hex: "#D0392E"), dark: Color(hex: "#FF6F61"))
+    /// 录音中按钮的实心底色（白字对比度 ≥4.5:1）
+    static let recordingFill = Color(light: Color(hex: "#C0352B"), dark: Color(hex: "#C23A2F"))
 
     // 尺寸
     enum Radius {

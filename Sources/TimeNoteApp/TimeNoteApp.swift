@@ -24,7 +24,7 @@ struct TimeNoteApp: App {
 
                 Divider()
 
-                Button("导出项目…") {
+                Button("导出项目…（文本 / Excel / PDF）") {
                     NotificationCenter.default.post(name: .timeNoteExportProject, object: nil)
                 }
                 .keyboardShortcut("e", modifiers: .command)
@@ -61,6 +61,20 @@ struct TimeNoteApp: App {
                     NotificationCenter.default.post(name: .timeNoteToggleAttachments, object: nil)
                 }
                 .keyboardShortcut("a", modifiers: [.command, .option])
+
+                Divider()
+
+                Button("开始/停止录音") {
+                    NotificationCenter.default.post(name: .timeNoteToggleRecording, object: nil)
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+
+                Button("显示/隐藏录音面板") {
+                    NotificationCenter.default.post(name: .timeNoteToggleRecordingPanel, object: nil)
+                }
+                .keyboardShortcut("r", modifiers: [.command, .option])
+
+                Divider()
 
                 Button("立即备份") {
                     NotificationCenter.default.post(name: .timeNoteCreateBackup, object: nil)
@@ -102,6 +116,8 @@ extension Notification.Name {
     static let timeNoteToggleAttachments = Notification.Name("TimeNote.toggleAttachments")
     static let timeNoteExportProject = Notification.Name("TimeNote.exportProject")
     static let timeNoteCopyCurrentTab = Notification.Name("TimeNote.copyCurrentTab")
+    static let timeNoteToggleRecording = Notification.Name("TimeNote.toggleRecording")
+    static let timeNoteToggleRecordingPanel = Notification.Name("TimeNote.toggleRecordingPanel")
     /// 窗口失活/退出时通知视图层立即 flush 自身草稿（EntryRowView 等）
     static let timeNoteFlushPendingEdits = Notification.Name("TimeNote.flushPendingEdits")
 }

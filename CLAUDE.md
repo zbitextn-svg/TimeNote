@@ -2,7 +2,7 @@
 
 ## 项目
 
-macOS 14+ 原生 SwiftUI 应用；Swift 6.1+（swift-tools-version 6.1）、Swift 6 language mode；Swift Package Manager；系统 SQLite3。优先阅读 README.md 与 Package.swift。
+原生 SwiftUI 应用（运行要求 macOS 26，编译目标保持 macOS 14，原因见 README「开发环境」）；Swift 6.1+（swift-tools-version 6.1）、Swift 6 language mode；Swift Package Manager；系统 SQLite3。优先阅读 README.md 与 Package.swift。
 
 ## 架构入口
 
@@ -15,13 +15,15 @@ macOS 14+ 原生 SwiftUI 应用；Swift 6.1+（swift-tools-version 6.1）、Swif
 - SQLiteDatabase.swift：表结构、迁移、CRUD、搜索、事务。
 - Models.swift：模型及时间处理。
 - AttachmentService / RecoveryService / ExportService / WindowService：对应服务。
+- RecordingService / LiveTranscriber / TimeNoteStore+Recording / RecordingViews：录音、本机转写、回放（注意事项见 README「录音开发注意事项」）。
+- ReportExport.swift：Excel、PDF 场记单与完整资料包（zip）。
 - Tests/TimeNoteAppTests：使用 Swift Testing。
 
 ## 开发流程
 
 1. 先检查当前实现，再围绕用户需求做范围明确的修改。
 2. 验证使用 swift build 与 swift test；界面修改还需在 macOS 手动检查。
-3. 打包使用 zsh scripts/package_app.sh（默认版本见 AppInfo.swift，当前 V1.1.23）。脚本通过 swift build --show-bin-path 定位编译产物。
+3. 打包使用 zsh scripts/package_app.sh（默认版本见 AppInfo.swift，当前 V1.2.0）。脚本通过 swift build --show-bin-path 定位编译产物。
 4. 不提交 .build、dist、真实用户数据库、附件、备份、凭证或环境文件。
 5. 文档 docs/ 是历史背景，可能与当前实现存在差异，不应自动当作待执行任务。
 

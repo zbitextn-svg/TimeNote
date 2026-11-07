@@ -92,6 +92,14 @@ package_dev_app() {
   bin_path="$(swift build --manifest-cache none --show-bin-path)/TimeNoteApp"
   mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
   cp -f "$bin_path" "$APP_DIR/Contents/MacOS/TimeNoteApp"
+  # 应用图标（与正式版相同）
+  local iconset="$DEV_DIR/AppIcon.iconset"
+  if [[ ! -f "$APP_DIR/Contents/Resources/AppIcon.icns" ]]; then
+    rm -rf "$iconset" && mkdir -p "$iconset"
+    cp "$ROOT_DIR"/Sources/TimeNoteApp/Assets.xcassets/AppIcon.appiconset/*.png "$iconset/" 2>/dev/null
+    iconutil -c icns "$iconset" -o "$APP_DIR/Contents/Resources/AppIcon.icns" 2>/dev/null
+    rm -rf "$iconset"
+  fi
   cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -101,11 +109,14 @@ package_dev_app() {
   <key>CFBundleIdentifier</key><string>com.frey.TimeNoteApp.dev</string>
   <key>CFBundleName</key><string>TimeNote Dev</string>
   <key>CFBundleDisplayName</key><string>TimeNote Dev</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.1.23-dev</string>
+  <key>CFBundleShortVersionString</key><string>dev</string>
   <key>CFBundleVersion</key><string>1</string>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>TimeNote 需要使用麦克风来录制现场声音。</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>TimeNote 会在本机把录音转成文字，录音不会上传。</string>
 </dict>
 </plist>
 PLIST
@@ -117,8 +128,15 @@ run_dev_app() {
   pkill -f "TimeNote Dev.app/Contents/MacOS/TimeNoteApp" 2>/dev/null
   sleep 0.5
   package_dev_app || return 1
-  # 直接启动可执行文件，以便继承 TIMENOTE_DATA_DIR 等环境变量
-  TIMENOTE_DEMO_SEED=1 TIMENOTE_APPEARANCE="$appearance" "$APP_DIR/Contents/MacOS/TimeNoteApp" > "$DEV_DIR/app.log" 2>&1 &
+  # 通过 open 启动：这样麦克风等权限会记在 TimeNote Dev 名下，而不是终端；
+  # 用 --env 传入临时数据目录等环境变量
+  if ! open -n "$APP_DIR" \
+      --env TIMENOTE_DATA_DIR="$DATA_DIR" \
+      --env TIMENOTE_DEMO_SEED=1 \
+      --env TIMENOTE_APPEARANCE="$appearance" \
+      --stdout "$DEV_DIR/app.log" --stderr "$DEV_DIR/app.log" 2>>"$DEV_DIR/app.log"; then
+    TIMENOTE_DEMO_SEED=1 TIMENOTE_APPEARANCE="$appearance" "$APP_DIR/Contents/MacOS/TimeNoteApp" > "$DEV_DIR/app.log" 2>&1 &
+  fi
   return 0
 }
 
@@ -146,6 +164,36 @@ while true; do
       result="done $job_id"
       for step in ${words[2,-1]}; do
         case "$step" in
+          sdk)
+            # 复制系统 SDK 里 Speech 框架的 Swift 接口，供核对 API
+            mkdir -p "$DEV_DIR/sdk"
+            sdk_path="${SDKROOT:-$(xcrun --show-sdk-path)}"
+            cp -f "$sdk_path"/System/Library/Frameworks/Speech.framework/Modules/Speech.swiftmodule/*.swiftinterface "$DEV_DIR/sdk/" 2>"$DEV_DIR/sdk/err.log"
+            echo "$sdk_path" > "$DEV_DIR/sdk/path.txt"
+            ls "$sdk_path"/System/Library/Frameworks/Speech.framework/Modules/Speech.swiftmodule/ >> "$DEV_DIR/sdk/path.txt" 2>&1
+            result="$result sdk=0"
+            ;;
+          grab-exports)
+            # 把导出到「下载」里的场记单复制一份到 .dev/exports，便于检查
+            mkdir -p "$DEV_DIR/exports"
+            cp -f "$HOME"/Downloads/*场记单.pdf "$HOME"/Downloads/*场记单.xlsx "$HOME"/Downloads/*场记资料.zip "$DEV_DIR/exports/" 2>/dev/null
+            result="$result grab-exports=0"
+            ;;
+          crashlog)
+            # 复制最近的崩溃报告，便于排查
+            mkdir -p "$DEV_DIR/crash"
+            latest=$(ls -t "$HOME"/Library/Logs/DiagnosticReports/TimeNoteApp*.ips 2>/dev/null | head -3)
+            for f in ${(f)latest}; do cp -f "$f" "$DEV_DIR/crash/"; done
+            /usr/bin/log show --last 3h --style compact --predicate 'process == "TimeNoteApp"' > "$DEV_DIR/crash/system.log" 2>&1
+            result="$result crashlog=0"
+            ;;
+          script)
+            # 运行 .dev/script.sh（开发期诊断用），输出写到 .dev/script.log
+            if [[ -f "$DEV_DIR/script.sh" ]]; then
+              (cd "$ROOT_DIR" && zsh "$DEV_DIR/script.sh") > "$DEV_DIR/script.log" 2>&1
+              result="$result script=$?"
+            fi
+            ;;
           diag)
             write_diagnostics
             result="$result diag=0"
@@ -182,9 +230,12 @@ while true; do
             echo "  run -> $code"
             ;;
           commit)
-            # 在本地开发克隆里创建分支并提交（不会推送）；提交说明来自 .dev/commit-msg.txt
+            # 在本地开发克隆里提交（不会推送）；提交说明来自 .dev/commit-msg.txt，
+            # 分支名来自 .dev/branch（没有该文件时使用当前分支）
             {
-              git checkout -B claude/v22-refresh && git add -A && git commit -F "$DEV_DIR/commit-msg.txt" && git log --oneline -3
+              branch="$(cat "$DEV_DIR/branch" 2>/dev/null)"
+              branch="${branch:-$(git branch --show-current)}"
+              git checkout -B "$branch" && git add -A && git commit -F "$DEV_DIR/commit-msg.txt" && git log --oneline -3
             } > "$DEV_DIR/commit.log" 2>&1
             code=$?
             result="$result commit=$code"

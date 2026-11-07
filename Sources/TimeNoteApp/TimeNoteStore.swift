@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 import SwiftUI
 
@@ -34,6 +35,7 @@ final class TimeNoteStore: ObservableObject {
     @Published var highlightedEntryID: String?
     @Published var highlightedAttachmentID: String?
     @Published var isAttachmentPanelPresented = false
+    @Published var isExportPanelPresented = false
     @Published private(set) var projectStats: [String: ProjectEntryStats] = [:]
     @Published private(set) var toast: ToastMessage?
     @Published var inputFocusNonce = 0
@@ -50,8 +52,41 @@ final class TimeNoteStore: ObservableObject {
     @Published private(set) var isSearchPending = false
     @Published private(set) var isWindowPinned: Bool
 
-    private let database: SQLiteDatabase
-    private let attachmentService: AttachmentService
+    // MARK: 录音（逻辑见 TimeNoteStore+Recording.swift）
+    /// 当前项目的录音，最新在前
+    @Published var recordings: [Recording] = []
+    /// 正在进行的录音（可能属于其他项目）
+    @Published var recordingSession: RecordingSession?
+    /// 正在申请权限 / 启动录音
+    @Published var isStartingRecording = false
+    /// 停止后正在整理最后一句转写与压缩文件
+    @Published var isFinishingRecording = false
+    /// 右侧录音面板
+    @Published var isRecordingPanelPresented = false
+    @Published var selectedRecordingID: String?
+    @Published var selectedRecordingSegments: [TranscriptSegment] = []
+    @Published var playback: PlaybackState?
+    /// 正在对已保存的录音文件做转写（补转写）
+    @Published var transcribingRecordingIDs: Set<String> = []
+    /// 电平、未定稿文字、播放进度等高频状态
+    let live = LiveAudioState()
+    /// 需要在转写列表中定位并高亮的句子
+    @Published var highlightedSegmentID: String?
+    @Published var inputDevices: [AudioInputDevice] = []
+    @Published var selectedInputDeviceUID: String? {
+        didSet { UserDefaults.standard.set(selectedInputDeviceUID, forKey: "TimeNote.inputDeviceUID") }
+    }
+    @Published var transcriptLocaleIdentifier: String {
+        didSet { UserDefaults.standard.set(transcriptLocaleIdentifier, forKey: "TimeNote.transcriptLocale") }
+    }
+    var audioCapture: AudioCapture?
+    var transcriptFeed: TranscriptFeed?
+    var recordingTasks: [Task<Void, Never>] = []
+    var audioPlayer: AVAudioPlayer?
+    var playbackTask: Task<Void, Never>?
+
+    let database: SQLiteDatabase
+    let attachmentService: AttachmentService
     private var toastAction: (() -> Void)?
     private var toastDismissTask: Task<Void, Never>?
     private let exportService = ExportService()
@@ -78,6 +113,8 @@ final class TimeNoteStore: ObservableObject {
     ///   测试应传入临时目录，避免读写真实数据。
     init(rootDirectory: URL? = nil) {
         isWindowPinned = UserDefaults.standard.bool(forKey: Self.windowPinnedDefaultsKey)
+        selectedInputDeviceUID = UserDefaults.standard.string(forKey: "TimeNote.inputDeviceUID")
+        transcriptLocaleIdentifier = UserDefaults.standard.string(forKey: "TimeNote.transcriptLocale") ?? "zh-CN"
         attachmentService = AttachmentService(rootURL: rootDirectory)
         do {
             let initialized = try Self.makeDatabase(rootDirectory: rootDirectory)
@@ -98,6 +135,7 @@ final class TimeNoteStore: ObservableObject {
             }
             #endif
             try reloadAll()
+            recoverUnfinishedRecordings()
         } catch {
             fatalError("TimeNote 初始化失败：\(error.localizedDescription)")
         }
@@ -215,6 +253,13 @@ final class TimeNoteStore: ObservableObject {
     }
 
     func deleteProject(id: String) {
+        if recordingSession?.projectID == id {
+            transientError = "这个项目正在录音，请先停止录音再删除。"
+            return
+        }
+        if let playing = playback, recordings.contains(where: { $0.id == playing.recordingID }), selectedProjectID == id {
+            stopPlayback()
+        }
         performDatabaseUpdate {
             let wasSelected = selectedProjectID == id
             let projectTabs = try database.fetchTabs(projectID: id)
@@ -254,6 +299,9 @@ final class TimeNoteStore: ObservableObject {
         // 清空主场记输入草稿，防止旧项目的内容串到新项目
         entryInputText = ""
         inputHistoryIndex = nil
+        if selectedProjectID != id {
+            stopPlayback()
+        }
         selectedProjectID = id
         inputHistory = loadInputHistory(projectID: id)
         refreshCurrentProject()
@@ -517,22 +565,131 @@ final class TimeNoteStore: ObservableObject {
         }
     }
 
+    func exportCurrentProject(format: ExportFormat) {
+        guard let project = selectedProject else { return }
+        guard format != .text else {
+            exportCurrentProject()
+            return
+        }
+        if format == .package {
+            exportProjectPackage(project)
+            return
+        }
+        flushPendingTextDrafts()
+        do {
+            let report = try makeReport(for: project)
+            let data: Data
+            switch format {
+            case .excel:
+                data = XLSXReportWriter.data(for: report)
+            case .pdf:
+                data = PDFReportWriter.data(for: report)
+            case .text, .package:
+                return
+            }
+            if let exportedURL = try exportService.export(data: data, format: format, suggestedFileName: "\(project.title) 场记单") {
+                showToast("已导出：\(exportedURL.lastPathComponent)", style: .success, actionTitle: "在访达中显示") {
+                    NSWorkspace.shared.activateFileViewerSelecting([exportedURL])
+                }
+            }
+        } catch {
+            transientError = error.localizedDescription
+        }
+    }
+
+    /// 汇总导出场记单需要的数据（场记、文本标签、录音与转写）
+    func makeReport(for project: Project, exportedAt: Date = .now) throws -> ProjectReport {
+        let projectTabs = resolvedTabsSnapshot(for: project.id)
+        let entries = try projectTabs
+            .filter { $0.kind == .mainLog }
+            .flatMap { try database.fetchEntries(projectID: project.id, tabID: $0.id) }
+        let textSections = projectTabs
+            .filter { $0.kind == .text }
+            .map { ProjectReport.TextSection(title: $0.title, body: $0.body) }
+        let recordingSections = try database.fetchRecordings(projectID: project.id)
+            .sorted { $0.startedAt < $1.startedAt }
+            .map { ProjectReport.RecordingSection(recording: $0, segments: try database.fetchTranscriptSegments(recordingID: $0.id)) }
+            // 不导出没有声音也没有文字的空录音
+            .filter { $0.recording.status == .recording || $0.recording.durationMs >= 500 || $0.segments.isEmpty == false }
+        return ProjectReport(
+            projectTitle: project.title,
+            exportedAt: exportedAt,
+            entries: entries,
+            textSections: textSections,
+            recordings: recordingSections
+        )
+    }
+
+    /// 完整资料包：场记单（PDF、Excel、文本）+ 录音文字 + 原始录音，压缩成一个 .zip
+    private func exportProjectPackage(_ project: Project) {
+        flushPendingTextDrafts()
+        guard let destination = exportService.chooseDestination(format: .package, suggestedFileName: "\(project.title) 场记资料") else {
+            return
+        }
+        do {
+            let report = try makeReport(for: project)
+            // 正在录制的录音文件还不完整，不放进资料包
+            let sections = report.recordings.filter { $0.recording.status != .recording }
+            let names = ProjectPackageBuilder.baseNames(for: sections.map(\.recording), sanitize: exportService.sanitizeFileName)
+            var audio: [ProjectPackageBuilder.AudioFile] = []
+            var transcripts: [ProjectPackageBuilder.TextFile] = []
+            for section in sections {
+                let baseName = names[section.recording.id] ?? section.recording.title
+                transcripts.append(.init(fileName: baseName + ".txt", text: exportService.transcriptText(for: section)))
+                if let url = try? attachmentService.attachmentURL(relativePath: section.recording.relativePath),
+                   FileManager.default.fileExists(atPath: url.path) {
+                    audio.append(.init(source: url, fileName: baseName + "." + url.pathExtension))
+                }
+            }
+            let contents = ProjectPackageBuilder.Contents(
+                folderName: exportService.sanitizeFileName("\(project.title) 场记资料"),
+                pdf: PDFReportWriter.data(for: report),
+                xlsx: XLSXReportWriter.data(for: report),
+                text: projectTextExport(project, recordings: report.recordings),
+                transcripts: transcripts,
+                audio: audio
+            )
+            let skipped = report.recordings.count - sections.count
+            showToast(audio.isEmpty ? "正在打包…" : "正在打包（含 \(audio.count) 段录音）…", style: .info)
+            Task { @MainActor in
+                let result = await Task.detached(priority: .userInitiated) { () -> Result<Void, Error> in
+                    Result { try ProjectPackageBuilder.build(contents, at: destination) }
+                }.value
+                switch result {
+                case .success:
+                    let note = skipped > 0 ? "（正在录制的录音未包含）" : ""
+                    showToast("已导出资料包：\(destination.lastPathComponent)\(note)", style: .success, actionTitle: "在访达中显示") {
+                        NSWorkspace.shared.activateFileViewerSelecting([destination])
+                    }
+                case .failure(let error):
+                    transientError = "资料包导出失败：\(error.localizedDescription)"
+                }
+            }
+        } catch {
+            transientError = error.localizedDescription
+        }
+    }
+
+    private func projectTextExport(_ project: Project, recordings: [ProjectReport.RecordingSection]) -> String {
+        let projectTabs = resolvedTabsSnapshot(for: project.id)
+        var entriesByTab: [String: [LogEntry]] = [:]
+        for tab in projectTabs where tab.kind == .mainLog {
+            entriesByTab[tab.id] = (try? database.fetchEntries(projectID: project.id, tabID: tab.id)) ?? []
+        }
+        return exportService.makeProjectExportContent(
+            project: project,
+            tabs: projectTabs,
+            entriesByTab: entriesByTab,
+            recordings: recordings
+        )
+    }
+
     func exportCurrentProject() {
         guard let project = selectedProject else { return }
 
         do {
-            let projectTabs = resolvedTabsSnapshot(for: project.id)
-            var entriesByTab: [String: [LogEntry]] = [:]
-
-            for tab in projectTabs where tab.kind == .mainLog {
-                entriesByTab[tab.id] = try database.fetchEntries(projectID: project.id, tabID: tab.id)
-            }
-
-            let content = exportService.makeProjectExportContent(
-                project: project,
-                tabs: projectTabs,
-                entriesByTab: entriesByTab
-            )
+            let recordings = try makeReport(for: project).recordings
+            let content = projectTextExport(project, recordings: recordings)
             if let exportedURL = try exportService.export(content: content, suggestedFileName: project.title) {
                 showToast("已导出：\(exportedURL.lastPathComponent)", style: .success)
             }
@@ -729,6 +886,10 @@ final class TimeNoteStore: ObservableObject {
             highlightEntry(entryID)
         }
 
+        if let recordingID = result.recordingID {
+            revealTranscript(recordingID: recordingID, offsetMs: result.recordingOffsetMs ?? 0)
+        }
+
         if let attachmentID = result.attachmentID,
            let attachment = attachments.first(where: { $0.id == attachmentID }) {
             highlightedEntryID = nil
@@ -777,7 +938,7 @@ final class TimeNoteStore: ObservableObject {
         projectStats = try database.fetchEntryStats()
     }
 
-    private func refreshProjectStats() {
+    func refreshProjectStats() {
         do {
             projectStats = try database.fetchEntryStats()
         } catch {
@@ -832,6 +993,7 @@ final class TimeNoteStore: ObservableObject {
     private func refreshCurrentProject() {
         guard let selectedProjectID else {
             attachments = []
+            recordings = []
             tabs = []
             entries = []
             selectedTabID = nil
@@ -843,6 +1005,7 @@ final class TimeNoteStore: ObservableObject {
 
         do {
             attachments = try database.fetchAttachments(projectID: selectedProjectID)
+            refreshRecordings()
             tabs = try database.fetchTabs(projectID: selectedProjectID).map { tab in
                 var resolvedTab = tab
                 if let draftBody = textDraftBodies[tab.id] {
@@ -863,7 +1026,7 @@ final class TimeNoteStore: ObservableObject {
         }
     }
 
-    private func refreshEntries() {
+    func refreshEntries() {
         guard
             let selectedProjectID,
             let mainTab = tabs.first(where: { $0.kind == .mainLog })
@@ -879,7 +1042,7 @@ final class TimeNoteStore: ObservableObject {
         }
     }
 
-    private func performDatabaseUpdate(_ operation: () throws -> Void) {
+    func performDatabaseUpdate(_ operation: () throws -> Void) {
         do {
             try operation()
         } catch {
@@ -887,7 +1050,7 @@ final class TimeNoteStore: ObservableObject {
         }
     }
 
-    private func highlightEntry(_ entryID: String) {
+    func highlightEntry(_ entryID: String) {
         highlightedEntryID = entryID
         Task { @MainActor in
             try? await Task.sleep(for: Timing.highlightDuration)

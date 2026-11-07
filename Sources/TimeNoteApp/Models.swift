@@ -77,11 +77,74 @@ struct AttachmentItem: Identifiable, Equatable {
     let updatedAt: Date
 }
 
+/// 一段录音。录音按「开始时间 + 时长」对应到墙上时间，
+/// 因此场记条目不需要额外字段：记录时间落在录音区间内，就能算出它在录音里的位置。
+struct Recording: Identifiable, Equatable {
+    enum Status: String {
+        /// 正在录制（应用异常退出后会停留在这个状态，下次启动时恢复）
+        case recording
+        /// 正常结束
+        case finished
+        /// 录制中断（崩溃、断电等），已尽量恢复
+        case interrupted
+    }
+
+    let id: String
+    let projectID: String
+    var title: String
+    var relativePath: String
+    let startedAt: Date
+    var durationMs: Int64
+    var fileSize: Int64
+    var locale: String
+    var status: Status
+    let createdAt: Date
+    var updatedAt: Date
+
+    var duration: TimeInterval { TimeInterval(durationMs) / 1000 }
+    var endedAt: Date { startedAt.addingTimeInterval(duration) }
+
+    /// 某个时刻在这段录音里的位置（秒）；不在录音区间内时返回 nil。
+    /// 正在录制的录音，区间截止到 `now`。
+    func offset(of date: Date, now: Date = .now) -> TimeInterval? {
+        let end = status == .recording ? now : endedAt
+        guard date >= startedAt, date <= end else { return nil }
+        return date.timeIntervalSince(startedAt)
+    }
+}
+
+struct TranscriptSegment: Identifiable, Equatable {
+    let id: String
+    let recordingID: String
+    let projectID: String
+    let startMs: Int64
+    let endMs: Int64
+    var text: String
+
+    var start: TimeInterval { TimeInterval(startMs) / 1000 }
+    var end: TimeInterval { TimeInterval(endMs) / 1000 }
+}
+
+enum DurationFormats {
+    /// 录音时长/位置：不足 1 小时显示 mm:ss，否则 h:mm:ss
+    static func string(from seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds.rounded(.down)))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, secs)
+        }
+        return String(format: "%02d:%02d", minutes, secs)
+    }
+}
+
 enum SearchResultKind: String, Equatable {
     case project
     case tabTitle = "tab_title"
     case tabBody = "tab_body"
     case logEntry = "log_entry"
+    case transcript
     case attachment
 
     var label: String {
@@ -94,6 +157,8 @@ enum SearchResultKind: String, Equatable {
             return "文本内容"
         case .logEntry:
             return "场记"
+        case .transcript:
+            return "录音文字"
         case .attachment:
             return "附件"
         }
@@ -109,6 +174,8 @@ enum SearchResultKind: String, Equatable {
             return "doc.text"
         case .logEntry:
             return "clock"
+        case .transcript:
+            return "waveform"
         case .attachment:
             return "paperclip"
         }
@@ -125,8 +192,10 @@ enum SearchResultKind: String, Equatable {
             return 2
         case .tabBody:
             return 3
-        case .attachment:
+        case .transcript:
             return 4
+        case .attachment:
+            return 5
         }
     }
 }
@@ -142,6 +211,9 @@ struct SearchResult: Identifiable, Equatable {
     let secondaryText: String
     let snippet: String
     let updatedAt: Date
+    /// 录音文字结果：所在录音与句子在录音中的位置（毫秒）
+    var recordingID: String? = nil
+    var recordingOffsetMs: Int64? = nil
 }
 
 enum TimeFormats {

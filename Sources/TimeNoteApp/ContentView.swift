@@ -59,6 +59,10 @@ struct ContentView: View {
         } detail: {
             detail
                 .toolbar { detailToolbar }
+                .inspector(isPresented: $store.isRecordingPanelPresented) {
+                    RecordingPanel(store: store)
+                        .inspectorColumnWidth(min: 280, ideal: 330, max: 460)
+                }
         }
         .navigationTitle(store.selectedProject?.title ?? "TimeNote")
         .modifier(HiddenToolbarTitle())
@@ -297,6 +301,14 @@ struct ContentView: View {
             }
             .help(store.isWindowPinned ? "取消窗口置顶" : "让窗口始终显示在最前面")
 
+            Button {
+                store.isRecordingPanelPresented.toggle()
+            } label: {
+                Label("录音", systemImage: store.isRecording ? "waveform.badge.mic" : "waveform")
+            }
+            .help(store.recordings.isEmpty ? "录音与转写文字（⌥⌘R）" : "录音：\(store.recordings.count) 段（⌥⌘R）")
+            .disabled(store.selectedProject == nil)
+
             // 附件以弹出面板显示，浮在内容之上，不挤占主场记和文本标签的宽度
             Button {
                 store.isAttachmentPanelPresented.toggle()
@@ -350,10 +362,16 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .center, spacing: 16) {
+        HStack(alignment: .center, spacing: 10) {
             headerTitle
-            ExportButton {
-                store.exportCurrentProject()
+            RecordButton(store: store)
+            ExportButton(isPresented: $store.isExportPanelPresented) { format in
+                store.isExportPanelPresented = false
+                // 等弹出面板收起后再打开保存面板
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(120))
+                    store.exportCurrentProject(format: format)
+                }
             }
         }
         .padding(.horizontal, Theme.Spacing.pageHorizontal)
@@ -755,7 +773,7 @@ private struct MoreCommandHandlers: ViewModifier {
                 store.isAttachmentPanelPresented.toggle()
             }
             .onReceive(NotificationCenter.default.publisher(for: .timeNoteExportProject)) { _ in
-                store.exportCurrentProject()
+                store.isExportPanelPresented.toggle()
             }
             .onReceive(NotificationCenter.default.publisher(for: .timeNoteCopyCurrentTab)) { _ in
                 store.copyCurrentTab()
@@ -766,11 +784,18 @@ private struct MoreCommandHandlers: ViewModifier {
             }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                 flushAll()
+                store.stopRecordingForTermination()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .timeNoteToggleRecording)) { _ in
+                store.toggleRecording()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .timeNoteToggleRecordingPanel)) { _ in
+                store.isRecordingPanelPresented.toggle()
             }
     }
 }
 
-/// macOS 15+ 隐藏工具栏中的窗口标题（标题已显示在内容区，可直接编辑）；macOS 14 保持默认。
+/// 隐藏工具栏中的窗口标题（标题已显示在内容区，可直接编辑）
 private struct HiddenToolbarTitle: ViewModifier {
     func body(content: Content) -> some View {
         if #available(macOS 15.0, *) {
@@ -1080,10 +1105,13 @@ private struct MainLogView: View {
                 ForEach(store.displayedDayGroups) { group in
                     Section {
                         ForEach(group.entries) { entry in
+                            let position = store.recordingPosition(for: entry)
                             EntryRowView(
                                 entry: entry,
                                 isHighlighted: store.highlightedEntryID == entry.id,
                                 compact: compactLayout,
+                                recordingLabel: position.map { "\($0.recording.title) \(DurationFormats.string(from: $0.offset))" },
+                                onPlayRecording: position == nil ? nil : { store.playEntry(entry) },
                                 onSave: { timeText, noteText in
                                     store.updateEntry(entry.id, timeText: timeText, noteText: noteText)
                                 },
@@ -1320,6 +1348,9 @@ private struct EntryRowView: View {
     let entry: LogEntry
     let isHighlighted: Bool
     let compact: Bool
+    /// 这条场记落在某段录音里时，例如「录音 1 03:12」
+    let recordingLabel: String?
+    let onPlayRecording: (() -> Void)?
     let onSave: (String, String) -> Void
     let onCopy: () -> Void
     let onDelete: () -> Void
@@ -1340,6 +1371,8 @@ private struct EntryRowView: View {
         entry: LogEntry,
         isHighlighted: Bool,
         compact: Bool,
+        recordingLabel: String? = nil,
+        onPlayRecording: (() -> Void)? = nil,
         onSave: @escaping (String, String) -> Void,
         onCopy: @escaping () -> Void,
         onDelete: @escaping () -> Void
@@ -1347,6 +1380,8 @@ private struct EntryRowView: View {
         self.entry = entry
         self.isHighlighted = isHighlighted
         self.compact = compact
+        self.recordingLabel = recordingLabel
+        self.onPlayRecording = onPlayRecording
         self.onSave = onSave
         self.onCopy = onCopy
         self.onDelete = onDelete
@@ -1380,6 +1415,12 @@ private struct EntryRowView: View {
                     }
 
                 HStack(spacing: 2) {
+                    if let onPlayRecording, let recordingLabel {
+                        Button(action: onPlayRecording) {
+                            Image(systemName: "play.circle")
+                        }
+                        .help("从\(recordingLabel)处回放")
+                    }
                     Button(action: onCopy) {
                         Image(systemName: "doc.on.doc")
                     }
@@ -1417,6 +1458,9 @@ private struct EntryRowView: View {
         .onHover { hovering in
             isHovered = hovering
         }
+        .accessibilityAction(named: "回放录音") {
+            onPlayRecording?()
+        }
         .accessibilityAction(named: "复制这一条") {
             onCopy()
         }
@@ -1424,6 +1468,12 @@ private struct EntryRowView: View {
             onDelete()
         }
         .contextMenu {
+            if let onPlayRecording, let recordingLabel {
+                Button("回放录音（\(recordingLabel)）") {
+                    onPlayRecording()
+                }
+                Divider()
+            }
             Button("复制这一条") {
                 onCopy()
             }
@@ -1726,6 +1776,8 @@ private struct SearchResultRow: View {
             return Theme.success
         case .tabTitle:
             return .blue
+        case .transcript:
+            return Theme.recording
         case .attachment:
             return Theme.textSecondary
         case .project:
@@ -1736,19 +1788,25 @@ private struct SearchResultRow: View {
 
 // MARK: - 附件面板
 
-/// 标题右侧的「导出」主按钮：琥珀色实心，是界面上最醒目的操作
+/// 标题右侧的「导出」主按钮：琥珀色实心，是界面上最醒目的操作。点开后选择导出格式。
 private struct ExportButton: View {
-    let action: () -> Void
+    @Binding var isPresented: Bool
+    let onExport: (ExportFormat) -> Void
     @State private var isHovered = false
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            isPresented.toggle()
+        } label: {
             HStack(spacing: 7) {
                 Image(systemName: "square.and.arrow.up")
                     .font(.system(size: 13, weight: .semibold))
                     .offset(y: -1)
                 Text("导出")
                     .font(.system(size: 14, weight: .semibold))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+                    .opacity(0.85)
             }
             .foregroundStyle(Color.white)
             .padding(.horizontal, 16)
@@ -1763,8 +1821,71 @@ private struct ExportButton: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
-        .help("把整个项目导出为 .txt 文件（⌘E）")
+        .help("导出整个项目：文本、Excel 或 PDF（⌘E）")
         .accessibilityLabel("导出项目")
+        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+            ExportFormatPicker(onExport: onExport)
+        }
+    }
+}
+
+private struct ExportFormatPicker: View {
+    let onExport: (ExportFormat) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("导出项目")
+                .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 10)
+                .padding(.top, 4)
+                .padding(.bottom, 6)
+            ForEach(ExportFormat.allCases) { format in
+                ExportFormatRow(format: format) {
+                    onExport(format)
+                }
+            }
+        }
+        .padding(8)
+        .frame(width: 280)
+    }
+}
+
+private struct ExportFormatRow: View {
+    let format: ExportFormat
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 11) {
+                Image(systemName: format.systemImageName)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Theme.accent)
+                    .frame(width: 32, height: 32)
+                    .background(
+                        RoundedRectangle(cornerRadius: Theme.Radius.small + 1, style: .continuous)
+                            .fill(Theme.accentSoft)
+                    )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(format.title)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.primary)
+                    Text(format.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: Theme.Radius.medium - 2, style: .continuous)
+                    .fill(isHovered ? Theme.hover : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
     }
 }
 

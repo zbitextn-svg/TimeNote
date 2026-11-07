@@ -500,6 +500,219 @@ final class SQLiteDatabase {
         try execute("DELETE FROM attachments WHERE id = ?", bindings: [.text(id)])
     }
 
+    // MARK: - 录音
+
+    private static let recordingColumns = """
+        id, project_id, title, relative_path, started_at, duration_ms, file_size, locale, status, created_at, updated_at
+        """
+
+    private static func makeRecording(_ statement: SQLiteStatement) -> Recording {
+        Recording(
+            id: statement.text(at: 0),
+            projectID: statement.text(at: 1),
+            title: statement.text(at: 2),
+            relativePath: statement.text(at: 3),
+            startedAt: statement.date(at: 4),
+            durationMs: statement.int64(at: 5),
+            fileSize: statement.int64(at: 6),
+            locale: statement.text(at: 7),
+            status: Recording.Status(rawValue: statement.text(at: 8)) ?? .finished,
+            createdAt: statement.date(at: 9),
+            updatedAt: statement.date(at: 10)
+        )
+    }
+
+    /// 项目的录音，最新的在前
+    func fetchRecordings(projectID: String) throws -> [Recording] {
+        try query(
+            """
+            SELECT \(Self.recordingColumns)
+            FROM recordings
+            WHERE project_id = ?
+            ORDER BY started_at DESC, rowid DESC
+            """,
+            bindings: [.text(projectID)],
+            transform: Self.makeRecording
+        )
+    }
+
+    func fetchRecording(id: String) throws -> Recording? {
+        try query(
+            "SELECT \(Self.recordingColumns) FROM recordings WHERE id = ? LIMIT 1",
+            bindings: [.text(id)],
+            transform: Self.makeRecording
+        ).first
+    }
+
+    /// 上次没有正常结束的录音（应用崩溃、断电等），启动时用于恢复
+    func fetchUnfinishedRecordings() throws -> [Recording] {
+        try query(
+            "SELECT \(Self.recordingColumns) FROM recordings WHERE status = 'recording' ORDER BY started_at ASC",
+            transform: Self.makeRecording
+        )
+    }
+
+    /// 意外中断、几乎没录到声音（不足 0.5 秒）又没有文字的录音，返回它们以便清理
+    func fetchEmptyInterruptedRecordings() throws -> [Recording] {
+        try query(
+            """
+            SELECT \(Self.recordingColumns) FROM recordings r
+            WHERE status = 'interrupted' AND duration_ms < 500
+              AND NOT EXISTS (SELECT 1 FROM transcript_segments s WHERE s.recording_id = r.id)
+            """,
+            transform: Self.makeRecording
+        )
+    }
+
+    @discardableResult
+    func insertRecording(
+        id: String = UUID().uuidString,
+        projectID: String,
+        title: String,
+        relativePath: String,
+        startedAt: Date,
+        locale: String
+    ) throws -> Recording {
+        let now = Date()
+        let recording = Recording(
+            id: id,
+            projectID: projectID,
+            title: title,
+            relativePath: relativePath,
+            startedAt: startedAt,
+            durationMs: 0,
+            fileSize: 0,
+            locale: locale,
+            status: .recording,
+            createdAt: now,
+            updatedAt: now
+        )
+        try execute(
+            """
+            INSERT INTO recordings (\(Self.recordingColumns))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            bindings: [
+                .text(recording.id),
+                .text(recording.projectID),
+                .text(recording.title),
+                .text(recording.relativePath),
+                .text(TimeFormats.iso8601String(from: recording.startedAt)),
+                .int64(0),
+                .int64(0),
+                .text(locale),
+                .text(Recording.Status.recording.rawValue),
+                .text(TimeFormats.iso8601String(from: now)),
+                .text(TimeFormats.iso8601String(from: now)),
+            ]
+        )
+        return recording
+    }
+
+    /// 录音结束（或恢复）后写入最终文件、时长与状态
+    func finishRecording(id: String, relativePath: String, durationMs: Int64, fileSize: Int64, status: Recording.Status) throws {
+        try execute(
+            """
+            UPDATE recordings
+            SET relative_path = ?, duration_ms = ?, file_size = ?, status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            bindings: [
+                .text(relativePath),
+                .int64(durationMs),
+                .int64(fileSize),
+                .text(status.rawValue),
+                .text(TimeFormats.iso8601String(from: Date())),
+                .text(id),
+            ]
+        )
+    }
+
+    /// 录音过程中定期更新时长，应用意外退出时也能知道大致录到了哪里
+    func updateRecordingProgress(id: String, durationMs: Int64) throws {
+        try execute(
+            "UPDATE recordings SET duration_ms = ? WHERE id = ? AND status = 'recording'",
+            bindings: [.int64(durationMs), .text(id)]
+        )
+    }
+
+    func renameRecording(id: String, title: String) throws {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else { return }
+        try execute(
+            "UPDATE recordings SET title = ?, updated_at = ? WHERE id = ?",
+            bindings: [.text(trimmed), .text(TimeFormats.iso8601String(from: Date())), .text(id)]
+        )
+    }
+
+    /// 删除录音记录及其转写（文件由调用方删除）
+    func deleteRecording(id: String) throws {
+        try performTransaction {
+            try execute("DELETE FROM transcript_segments WHERE recording_id = ?", bindings: [.text(id)])
+            try execute("DELETE FROM recordings WHERE id = ?", bindings: [.text(id)])
+        }
+    }
+
+    @discardableResult
+    func insertTranscriptSegment(recordingID: String, projectID: String, startMs: Int64, endMs: Int64, text: String) throws -> TranscriptSegment? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else { return nil }
+        let segment = TranscriptSegment(
+            id: UUID().uuidString,
+            recordingID: recordingID,
+            projectID: projectID,
+            startMs: max(0, startMs),
+            endMs: max(startMs, endMs),
+            text: trimmed
+        )
+        try execute(
+            """
+            INSERT INTO transcript_segments (id, recording_id, project_id, start_ms, end_ms, text, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            bindings: [
+                .text(segment.id),
+                .text(recordingID),
+                .text(projectID),
+                .int64(segment.startMs),
+                .int64(segment.endMs),
+                .text(trimmed),
+                .text(TimeFormats.iso8601String(from: Date())),
+            ]
+        )
+        return segment
+    }
+
+    func fetchTranscriptSegments(recordingID: String) throws -> [TranscriptSegment] {
+        try query(
+            """
+            SELECT id, recording_id, project_id, start_ms, end_ms, text
+            FROM transcript_segments
+            WHERE recording_id = ?
+            ORDER BY start_ms ASC, rowid ASC
+            """,
+            bindings: [.text(recordingID)]
+        ) { statement in
+            TranscriptSegment(
+                id: statement.text(at: 0),
+                recordingID: statement.text(at: 1),
+                projectID: statement.text(at: 2),
+                startMs: statement.int64(at: 3),
+                endMs: statement.int64(at: 4),
+                text: statement.text(at: 5)
+            )
+        }
+    }
+
+    func updateTranscriptSegment(id: String, text: String) throws {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            try execute("DELETE FROM transcript_segments WHERE id = ?", bindings: [.text(id)])
+        } else {
+            try execute("UPDATE transcript_segments SET text = ? WHERE id = ?", bindings: [.text(trimmed), .text(id)])
+        }
+    }
+
     @discardableResult
     func insertLogEntry(projectID: String, tabID: String, recordedAt: Date, noteText: String) throws -> LogEntry? {
         let trimmed = noteText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -725,6 +938,41 @@ final class SQLiteDatabase {
         }
         results.append(contentsOf: logResults)
 
+        let transcriptResults = try query(
+            """
+            SELECT s.id, s.project_id, s.recording_id, s.start_ms, s.text, p.title, r.title, r.started_at, p.is_archived
+            FROM transcript_segments s
+            JOIN recordings r ON r.id = s.recording_id
+            JOIN projects p ON p.id = s.project_id
+            WHERE \(likeClause("s.text"))
+            ORDER BY r.started_at DESC, s.start_ms ASC
+            LIMIT 80
+            """,
+            bindings: patterns
+        ) { statement in
+            let startMs = statement.int64(at: 3)
+            let startedAt = statement.date(at: 7)
+            let spokenAt = startedAt.addingTimeInterval(TimeInterval(startMs) / 1000)
+            let projectDescriptor = statement.int(at: 8) == 1
+                ? "\(statement.text(at: 5)) · \(statement.text(at: 6)) · 已归档"
+                : "\(statement.text(at: 5)) · \(statement.text(at: 6))"
+            return SearchResult(
+                id: "transcript-\(statement.text(at: 0))",
+                kind: .transcript,
+                projectID: statement.text(at: 1),
+                tabID: nil,
+                entryID: nil,
+                attachmentID: nil,
+                primaryText: "\(TimeFormats.clockString(from: spokenAt))  \(statement.text(at: 4))",
+                secondaryText: projectDescriptor,
+                snippet: "",
+                updatedAt: spokenAt,
+                recordingID: statement.text(at: 2),
+                recordingOffsetMs: startMs
+            )
+        }
+        results.append(contentsOf: transcriptResults)
+
         let attachmentResults = try query(
             """
             SELECT a.id, a.project_id, a.file_name, p.title, a.updated_at, p.is_archived, a.kind
@@ -871,6 +1119,38 @@ final class SQLiteDatabase {
             """
         )
 
+        // V1.2 新增：录音与转写。只新增表，不改动旧表，旧数据库打开时自动补建。
+        try execute(
+            """
+            CREATE TABLE IF NOT EXISTS recordings (
+              id TEXT PRIMARY KEY NOT NULL,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              title TEXT NOT NULL,
+              relative_path TEXT NOT NULL,
+              started_at TEXT NOT NULL,
+              duration_ms INTEGER NOT NULL DEFAULT 0,
+              file_size INTEGER NOT NULL DEFAULT 0,
+              locale TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'recording',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            """
+        )
+        try execute(
+            """
+            CREATE TABLE IF NOT EXISTS transcript_segments (
+              id TEXT PRIMARY KEY NOT NULL,
+              recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              start_ms INTEGER NOT NULL,
+              end_ms INTEGER NOT NULL,
+              text TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            """
+        )
+
         try execute("CREATE INDEX IF NOT EXISTS idx_projects_title ON projects(title);")
         try execute("CREATE INDEX IF NOT EXISTS idx_projects_updated_at ON projects(updated_at);")
         try execute("CREATE INDEX IF NOT EXISTS idx_tabs_project_sort ON tabs(project_id, sort_index);")
@@ -878,6 +1158,9 @@ final class SQLiteDatabase {
         try execute("CREATE INDEX IF NOT EXISTS idx_log_entries_project_tab_time ON log_entries(project_id, tab_id, recorded_at);")
         try execute("CREATE INDEX IF NOT EXISTS idx_attachments_project_created ON attachments(project_id, created_at);")
         try execute("CREATE INDEX IF NOT EXISTS idx_attachments_file_name ON attachments(file_name);")
+        try execute("CREATE INDEX IF NOT EXISTS idx_recordings_project_started ON recordings(project_id, started_at);")
+        try execute("CREATE INDEX IF NOT EXISTS idx_transcript_segments_recording ON transcript_segments(recording_id, start_ms);")
+        try execute("CREATE INDEX IF NOT EXISTS idx_transcript_segments_project ON transcript_segments(project_id);")
 
         let currentFullTextVersion = try stringValue(forMetaKey: "fts_schema_version")
         if currentFullTextVersion != Self.fullTextSchemaVersion {

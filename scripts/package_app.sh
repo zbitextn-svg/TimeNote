@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="TimeNoteApp"
 # 版本号与 Sources/TimeNoteApp/AppInfo.swift 保持一致
-APP_VERSION="${APP_VERSION:-1.1.23}"
+APP_VERSION="${APP_VERSION:-1.2.0}"
 # 支持环境变量覆盖，例如: BUNDLE_NAME=TimeNoteV1.1.23 zsh scripts/package_app.sh
 BUNDLE_NAME="${BUNDLE_NAME:-TimeNoteV${APP_VERSION}}"
 DIST_DIR="$ROOT_DIR/dist"
@@ -76,7 +76,11 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <key>NSHumanReadableCopyright</key>
   <string>Copyright 2026 frey</string>
   <key>LSMinimumSystemVersion</key>
-  <string>14.0</string>
+  <string>26.0</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>TimeNote 需要使用麦克风来录制现场声音。</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>TimeNote 会在本机把录音转成文字，录音不会上传。</string>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key>
